@@ -24,8 +24,14 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const ROOT = 'D:\\xiangmu'
+// 体系根：默认＝本文件所在目录（<体系根>\tools\）的上一级；`--root` 或环境变量 DSH_SYSTEM_ROOT 可覆盖。
+// （开源版：这里原来硬编码了本机盘符路径。）
+const TOOL_DIR = path.dirname(fileURLToPath(import.meta.url))
+const ROOT = process.env.DSH_SYSTEM_ROOT
+  ? path.resolve(process.env.DSH_SYSTEM_ROOT)
+  : path.resolve(TOOL_DIR, '..')
 const UNIFIED = path.join(ROOT, '各项目提案')
 const OUT_MD = path.join(UNIFIED, '提案总索引.md')
 const OUT_JSON = path.join(UNIFIED, '提案总索引.json')
@@ -171,7 +177,7 @@ function main() {
   const lines = []
   lines.push(SIGNATURE)
   lines.push('')
-  lines.push(`> 生成于 ${new Date().toLocaleString('sv-SE').replace('T', ' ')}（本机时区）｜工具 \`D:\\xiangmu\\tools\\proposal-index.mjs\` v${TOOL_VERSION}`)
+  lines.push(`> 生成于 ${new Date().toLocaleString('sv-SE').replace('T', ' ')}（本机时区）｜工具 \`${path.join(ROOT, 'tools', 'proposal-index.mjs')}\` v${TOOL_VERSION}`)
   lines.push(`> **扫到 ${items.length} 份文件**：唯一提案 **${uniq.length - diffs.length}** 份；worktree **字节完全相同**的副本 **${dupExact.length}** 份（下表不列为独立行）；**同名但内容不同**的 **${diffs.length}** 份（下表保留并标 ⚠️）`)
   lines.push(`> **未决策 ${undecided.length} 份** —— 这就是"只进不出"的规模`)
   lines.push(`> ⚠️ 那 ${diffs.length} 份"同名内容不同"是**真分叉**（worktree 与主工作区各改各的），迁移前要逐对比对，**别当成重复删掉**。`)

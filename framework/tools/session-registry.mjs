@@ -44,7 +44,7 @@
  *   domains  : <out-dir>\domains.json                            (在任声明 -- 「谁**现在**在任」，NOT a ledger:
  *              no history / no tasks / no status. Written and mutated ONLY by domain-owner.mjs; read-only here.
  *              Missing / unreadable / malformed = "无人在任" and NEVER an error -- the rest of the index must
- *              still print. 路径与格式见 D:\dsh\Generated\2026-10-10\域名册-接口约定.md §1；索引集成见 §3.)
+ *              still print. 路径与格式见 {数据根}\Generated\2026-10-10\域名册-接口约定.md §1；索引集成见 §3.)
  *
  * FIELD GOTCHAS THAT COST REAL TIME (verified 2026-09-18 -- do not "fix" these without re-verifying)
  *   - `tool/call.data.arguments` is a **JSON string**, not an object. Object.keys() on it returns
@@ -95,6 +95,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import { execFileSync } from 'node:child_process';
 
@@ -110,8 +111,20 @@ const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
 // `session.jsonl.zstd` (legacy) | `session.v3.jsonl.zstd` | `session.v4.jsonl.zstd` ...
 const ARCHIVE_RE = /^session(?:\.v(\d+))?\.jsonl\.zstd$/;
 
-const DEFAULT_OUT_DIR = 'D:\\xiangmu\\_registry';
-const DEFAULT_PROJECTS_ROOT = 'D:\\xiangmu';
+// 体系根：默认＝本文件所在目录（<体系根>/tools/）的上一级；环境变量 DSH_SYSTEM_ROOT 可覆盖。
+// （开源版：这里原来硬编码了本机盘符路径，别人 clone 下来会往不存在的目录写东西。）
+const TOOL_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SYSTEM_ROOT = process.env.DSH_SYSTEM_ROOT
+  ? path.resolve(process.env.DSH_SYSTEM_ROOT)
+  : path.resolve(TOOL_DIR, '..');
+// 体系外部的数据根（知识库等）；本机若在别处，用 DSH_DATA_ROOT 覆盖。
+const DATA_ROOT = process.env.DSH_DATA_ROOT
+  ? path.resolve(process.env.DSH_DATA_ROOT)
+  : path.join(os.homedir(), '.dsh');
+// 生成物里会写进「怎么刷新」这一句，路径按当前机器的体系根算出来，不再写死。
+const SELF_CMD = `node ${path.join(SYSTEM_ROOT, 'tools', 'session-registry.mjs')}`;
+const DEFAULT_OUT_DIR = path.join(SYSTEM_ROOT, '_registry');
+const DEFAULT_PROJECTS_ROOT = SYSTEM_ROOT;
 const INDEX_NAME = 'INDEX.md';
 const JSON_NAME = 'registry.json';
 // Handoff pack, v2.7.0: the **artifact is the JSON** (`handoff.json`); the one-page MD is an
@@ -138,9 +151,9 @@ const HANDOFF_ITEMS_ROOT = 6;    // MD only. 体系根是交接主文件：上�
 const HANDOFF_MAX_LINES = 62;    // MD only: hard stop: one page
 // 开局口径（P3）：新会话先读 handoff.json 拿导航；MD 要给人读时才现渲染。JSON 与 MD 头部共用这一句，
 // 免得两处口径各写各的。
-const HANDOFF_README = '开局先读本文件拿导航；体系侧活跃待办主表＝D:\\xiangmu\\PROJECT.md 的 §下一步；'
-  + '知识库坑/经验速查表＝D:\\dsh\\knowledge\\INDEX.md。本文件是派生产物、勿手改；'
-  + '重跑：node D:\\xiangmu\\tools\\session-registry.mjs --handoff；要给人读的 MD：同一命令加 --handoff-md。';
+const HANDOFF_README = '开局先读本文件拿导航；体系侧活跃待办主表＝' + path.join(SYSTEM_ROOT, 'PROJECT.md') + ' 的 §下一步；'
+  + '知识库坑/经验速查表＝' + path.join(DATA_ROOT, 'knowledge', 'INDEX.md') + '。本文件是派生产物、勿手改；'
+  + '重跑：' + SELF_CMD + ' --handoff；要给人读的 MD：同一命令加 --handoff-md。';
 // §四 补 changelog 标题的来源（体系侧"无使命登记"的活只有这里看得见）。
 const CHANGELOG_REL = path.join('templates', 'SYSTEM-changelog.md');
 // 域名册（在任声明）。默认与 INDEX.md 同目录；读不到＝"无人在任"，不是错误（契约 §1/§3）。
@@ -148,8 +161,14 @@ const DOMAINS_NAME = 'domains.json';
 const INDEX_SIGNATURE = '# 体系索引 · 会话/文件';
 
 // Files that other sessions are likely to touch from several projects. Used only to label rows.
-const SHARED_HINTS = ['D:\\dsh\\knowledge\\', 'D:\\xiangmu\\SYSTEM-OVERVIEW.md', 'D:\\xiangmu\\templates\\',
-  'D:\\xiangmu\\提案\\', 'D:\\xiangmu\\_registry\\', 'D:\\xiangmu\\tools\\'];
+const SHARED_HINTS = [
+  path.join(DATA_ROOT, 'knowledge') + path.sep,
+  path.join(SYSTEM_ROOT, 'SYSTEM-OVERVIEW.md'),
+  path.join(SYSTEM_ROOT, 'templates') + path.sep,
+  path.join(SYSTEM_ROOT, '提案') + path.sep,
+  path.join(SYSTEM_ROOT, '_registry') + path.sep,
+  path.join(SYSTEM_ROOT, 'tools') + path.sep,
+];
 
 // ---------------------------------------------------------------- argv
 
@@ -1021,7 +1040,7 @@ function renderSummary(opts, ctx, now) {
   const L = [];
   L.push(INDEX_SIGNATURE);
   L.push('');
-  L.push(`> **本索引生成于 ${stamp(builtAt)}** —— 读到时请与当前时间**自己比**：超过 ${opts.staleMinutes} 分钟就先跑 \`node D:\\xiangmu\\tools\\session-registry.mjs\`（约 10 秒）刷新再读。**刷新必须自己跑、不会自动。**`);
+  L.push(`> **本索引生成于 ${stamp(builtAt)}** —— 读到时请与当前时间**自己比**：超过 ${opts.staleMinutes} 分钟就先跑 \`${SELF_CMD}\`（约 10 秒）刷新再读。**刷新必须自己跑、不会自动。**`);
   if (prevAt !== null) {
     L.push(`> 上一次生成于 ${stamp(prevAt)}，距本次刷新 **${pubAgeText}**${pubAge > opts.staleMinutes ? '（⚠️ 覆盖了一段空档：这中间新起的会话/新做的使命，本表是补上的）' : ''} —— 这行只是**刷新间隔**，**不代表本文件现在的年龄**。`);
   }
@@ -1217,7 +1236,7 @@ function renderIndex(opts, ctx, now) {
   ];
   if (opts.full) parts.push(renderFileTable(ctx.files, opts));
   parts.push('---');
-  parts.push('> 刷新：`node D:\\xiangmu\\tools\\session-registry.mjs`　｜　全列（含使命一句话/分支/表二）：加 `--full`　｜　单文件反查：`--file "<路径>"`');
+  parts.push(`> 刷新：\`${SELF_CMD}\`　｜　全列（含使命一句话/分支/表二）：加 \`--full\`　｜　单文件反查：\`--file "<路径>"\``);
   parts.push('> 本文件由脚本生成，**不要手工编辑**（会被下次刷新覆盖）；需要改口径请改生成器或提案。');
   parts.push('');
   return parts.join('\n');
@@ -1439,14 +1458,14 @@ function handoffKeyPaths(opts, ctx, scope = null) {
   out.push(
     { label: '索引（人读）', path: path.join(opts.outDir, INDEX_NAME) },
     { label: '索引（机器读）', path: path.join(opts.outDir, JSON_NAME) },
-    { label: '体系总览（交接主文档＝机制正本；其 §五 自 2026-10-13「甲」起只剩指针——体系侧活跃待办主表＝体系 PROJECT.md 的 §下一步）', path: 'D:\\xiangmu\\SYSTEM-OVERVIEW.md' },
-    { label: '知识库坑/经验速查表', path: 'D:\\dsh\\knowledge\\INDEX.md' },
-    { label: '知识库方面文档目录', path: 'D:\\dsh\\knowledge\\aspects\\' },
+    { label: '体系总览（交接主文档＝机制正本；其 §五 自 2026-10-13「甲」起只剩指针——体系侧活跃待办主表＝体系 PROJECT.md 的 §下一步）', path: path.join(SYSTEM_ROOT, 'SYSTEM-OVERVIEW.md') },
+    { label: '知识库坑/经验速查表', path: path.join(DATA_ROOT, 'knowledge', 'INDEX.md') },
+    { label: '知识库方面文档目录', path: path.join(DATA_ROOT, 'knowledge', 'aspects') + path.sep },
     { label: '在任声明（只读真值）', path: opts.domainsPath },
     { label: `使命库（身份真值，${ctx.missions.length} 条）`, path: displayPath(opts.missionsDir) },
-    { label: '派发口径', path: 'D:\\xiangmu\\templates\\dispatch-template.md' },
+    { label: '派发口径', path: path.join(SYSTEM_ROOT, 'templates', 'dispatch-template.md') },
     { label: '域文档', path: 'KNOWLEDGE\\<域>.md' },
-    { label: '工具目录（session-registry.mjs / mission.mjs / domain-owner.mjs）', path: 'D:\\xiangmu\\tools\\' },
+    { label: '工具目录（session-registry.mjs / mission.mjs / domain-owner.mjs）', path: path.join(SYSTEM_ROOT, 'tools') + path.sep },
   );
   return out;
 }
@@ -1569,7 +1588,7 @@ function renderHandoff(opts, ctx, now, scope = null) {
   L.push(HANDOFF_SIGNATURE);
   L.push('');
   L.push(`> 生成于 ${stamp(now)}｜session-registry v${TOOL_VERSION} --handoff-md${scope ? ` --scope ${scope.label}` : ''}｜数据源＝使命库 + 本索引 + ${scope ? `「${scope.label}」的 PROJECT.md` : '各 PROJECT.md'}`);
-  L.push(`> **新会话开局**：先读 \`${opts.handoffPath}\` 拿导航（**真值源就是它**），**再补读两份**——体系总览 \`D:\\xiangmu\\SYSTEM-OVERVIEW.md\` 的 §五「待办」区（**自 2026-10-13「甲」起只剩一行指针**；**体系侧活跃待办主表＝体系 \`PROJECT.md\` 的 §下一步**）＋ 知识库坑/经验速查表 \`D:\\dsh\\knowledge\\INDEX.md\`（§五 也列了）。**有意不复制它们的待办正文**（同一口径写多处必烂）。**本页是那份 JSON 的按需渲染**、给人读时才现生成：不要手写，要改动就改上游文件再重跑：`);
+  L.push(`> **新会话开局**：先读 \`${opts.handoffPath}\` 拿导航（**真值源就是它**），**再补读两份**——体系总览 \`${path.join(SYSTEM_ROOT, 'SYSTEM-OVERVIEW.md')}\` 的 §五「待办」区（**自 2026-10-13「甲」起只剩一行指针**；**体系侧活跃待办主表＝体系 \`PROJECT.md\` 的 §下一步**）＋ 知识库坑/经验速查表 \`${path.join(DATA_ROOT, 'knowledge', 'INDEX.md')}\`（§五 也列了）。**有意不复制它们的待办正文**（同一口径写多处必烂）。**本页是那份 JSON 的按需渲染**、给人读时才现生成：不要手写，要改动就改上游文件再重跑：`);
   // A01: one layer per file. A project layer says so and points up; the system layer points back
   // at the per-project layers so a successor can tell the two apart. Unscoped keeps the old text.
   if (scope && scope.kind === 'project') {
@@ -1577,7 +1596,7 @@ function renderHandoff(opts, ctx, now, scope = null) {
   } else if (scope) {
     L.push(`> **本页只覆盖「体系」这一层**（A01 分层：体系／项目各生成一份、各落自己目录）｜**各项目自己的交接包**在其项目目录的 \`${HANDOFF_SCOPE_SUBDIR}\\${HANDOFF_JSON_NAME}\``);
   }
-  L.push('> `node D:\\xiangmu\\tools\\session-registry.mjs --handoff-md`（隐含 `--handoff`：JSON 是源、本页是它的渲染，两份一起写）');
+  L.push(`> \`${SELF_CMD} --handoff-md\`（隐含 \`--handoff\`：JSON 是源、本页是它的渲染，两份一起写）`);
   if (ctx.hadPrevious) {
     const gapMin = Math.max(0, Math.round((now - ctx.generatedAt) / 60000));
     L.push(`> 上一份索引生成于 ${stamp(ctx.generatedAt)}，距本次刷新 **${gapMin} 分钟**（只是刷新间隔，不是本文件年龄）。`);
@@ -1624,12 +1643,12 @@ function renderHandoff(opts, ctx, now, scope = null) {
     tail.push(`- **体系交接包（跨项目导航・本页只覆盖「${scope.label}」一层）** \`${systemHandoffPath}\``);
   }
   tail.push(`- 索引（人读）\`${path.join(opts.outDir, INDEX_NAME)}\`｜（机器读）\`${path.join(opts.outDir, JSON_NAME)}\``);
-  tail.push('- **体系总览**（交接主文档＝**机制正本**；**其 §五 自 2026-10-13「甲」起只剩指针——体系侧活跃待办主表＝体系 `PROJECT.md` 的 §下一步**）`D:\\xiangmu\\SYSTEM-OVERVIEW.md`');
-  tail.push('- **知识库坑/经验速查表** `D:\\dsh\\knowledge\\INDEX.md`｜方面文档目录 `D:\\dsh\\knowledge\\aspects\\`');
+  tail.push(`- **体系总览**（交接主文档＝**机制正本**；**其 §五 自 2026-10-13「甲」起只剩指针——体系侧活跃待办主表＝体系 \`PROJECT.md\` 的 §下一步**）\`${path.join(SYSTEM_ROOT, 'SYSTEM-OVERVIEW.md')}\``);
+  tail.push(`- **知识库坑/经验速查表** \`${path.join(DATA_ROOT, 'knowledge', 'INDEX.md')}\`｜方面文档目录 \`${path.join(DATA_ROOT, 'knowledge', 'aspects') + path.sep}\``);
   tail.push(`- 在任声明（只读真值）\`${opts.domainsPath}\``);
   tail.push(`- 使命库（身份真值，${ctx.missions.length} 条）\`${displayPath(opts.missionsDir)}\``);
-  tail.push('- 派发口径 `D:\\xiangmu\\templates\\dispatch-template.md`｜域文档 `KNOWLEDGE\\<域>.md`');
-  tail.push('- 工具 `D:\\xiangmu\\tools\\`：session-registry.mjs（本索引）/ mission.mjs（declare·complete）/ domain-owner.mjs');
+  tail.push(`- 派发口径 \`${path.join(SYSTEM_ROOT, 'templates', 'dispatch-template.md')}\`｜域文档 \`KNOWLEDGE\\<域>.md\``);
+  tail.push(`- 工具 \`${path.join(SYSTEM_ROOT, 'tools') + path.sep}\`：session-registry.mjs（本索引）/ mission.mjs（declare·complete）/ domain-owner.mjs`);
   tail.push('');
   tail.push('> 本页由脚本一次生成，同输入除时间戳外逐字节一致；**它是 `handoff.json` 的一页渲染，不另立台账**。');
 

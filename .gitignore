@@ -13,6 +13,18 @@ projectlog/
 logs/
 *.log
 
+## 本地环境与密文（永不进版本库）
+*.env
+*.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.*
+*.secret
+credentials.*
+*.kdbx
+
 ## 渲染产物（源是 .data.js，页是产物，删掉重跑能变回原样）
 _pages/*.html
 docs/**/*.png

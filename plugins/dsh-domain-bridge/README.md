@@ -1,6 +1,6 @@
 # dsh-domain-bridge
 
-**域可达层 v0.6.3（模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
+**域可达层 v0.6.4（安全默认：`domainSessionPreset` 缺省值由 `danger-full-access` 收窄为 `workspace-write`，要全盘写权限必须自己显式配置；无其它行为变化）**，模型分派见 `list_models` / `set_model` / `set_default_model`——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
 
 > v0.4.2 一句话：**任一级被按下就拦，拦的时候把「是哪几级按的」全部说出来；解一级不够——得把压着目标的那几级都解开，才会重投。**
 
@@ -365,7 +365,7 @@ config:
 ```yaml
 config:
   stateDir: '<你的目录>'                            # v0.4.0：政策轴「已暂停」+ 落盘队列；不给＝<home>/state，写 '' 也退回默认
-  domainSessionPreset: 'danger-full-access'        # v0.3.3：create_domain_session 建完设的权限档
+  domainSessionPreset: 'workspace-write'           # v0.3.3：create_domain_session 建完设的权限档；v0.6.4 起缺省＝workspace-write，要全权自己写 danger-full-access
 ```
 
 `indexFile` / `domainsFile` / `stateDir` **读不到或格式坏掉一律静默降级**（当成"没有域标注 / 没有人认领 / 没有暂停"），不抛错、不影响投递；`domainSessionPreset` 写 `''` / `none` 即关掉那一步（保持宿主默认档）。`<home>` 全空（没有 config、两个默认文件也不存在）时插件照常加载，只是报「0 个域」。

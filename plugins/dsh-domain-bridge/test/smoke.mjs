@@ -395,7 +395,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.6.3', `package.json 版本不是 0.6.3（实际 ${pkg.version}）`)
+eq(pkg.version, '0.6.4', `package.json 版本不是 0.6.4（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -1378,11 +1378,11 @@ const TITLE_RE = /^\[docs\] \d{4}-\d{2}-\d{2} \d{2}:\d{2} · /
     createExec,
     'v033/title-and-preset',
   )
-  eq(presets.calls.resolve, ['danger-full-access'], '默认应 resolve 配置里的档名')
+  eq(presets.calls.resolve, ['workspace-write'], '默认应 resolve 配置里的档名（v0.6.4 起缺省＝workspace-write）')
   eq(presets.calls.set.length, 1, 'set 应被调用一次')
   eq(presets.calls.set[0].session, created.session, 'set 必须拿到 Session 对象（不是 id）')
-  eq(presets.calls.set[0].name, 'danger-full-access', 'set 的档名不对')
-  eq(out.permission, { requested: true, preset: 'danger-full-access', ok: true }, 'permission 回执不对')
+  eq(presets.calls.set[0].name, 'workspace-write', 'set 的档名不对')
+  eq(out.permission, { requested: true, preset: 'workspace-write', ok: true }, 'permission 回执不对')
   eq(titles.calls.rename.length, 1, 'rename 应被调用一次')
   eq(titles.calls.rename[0].session, created.session, 'rename 必须拿到 Session 对象（不是 id）')
   const title = titles.calls.rename[0].title
@@ -1392,7 +1392,7 @@ const TITLE_RE = /^\[docs\] \d{4}-\d{2}-\d{2} \d{2}:\d{2} · /
   ok(!title.includes('\n'), '标题必须是单行')
   eq(out.titled.ok, true, 'titled.ok 应为 true')
   eq(created.sent.length, 1, '设档 + 命名不得影响排队开工任务')
-  ok(out.hint.includes('权限档已设成 danger-full-access'), 'hint 应说明权限档')
+  ok(out.hint.includes('权限档已设成 workspace-write'), 'hint 应说明权限档')
   ok(out.hint.includes('标题已设为'), 'hint 应说明标题')
 }
 

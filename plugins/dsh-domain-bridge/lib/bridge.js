@@ -1,5 +1,5 @@
 /**
- * dsh-domain-bridge — domain reachability layer v0.6.3
+ * dsh-domain-bridge — domain reachability layer v0.6.4
  *   (declaration-first + session factory + four-level pause + wake wiring + model dispatch)
  *
  * Tools (11):
@@ -54,10 +54,12 @@ export default {
         // v0.3.3: 新建域会话建完立刻设的权限档名（部署里可用 read-only / workspace-write /
         // danger-full-access；'' / 'none' / 'keep' / 'skip' ＝ 不动，保持宿主默认）。
         // 写成 !== undefined 而不是 ||，这样配置里显式写 '' 才算「关掉」，不会被默认值顶掉。
+        // v0.6.4（安全默认）：缺省值由 danger-full-access 收窄为 workspace-write。后台域会话无人值守
+        // 仍不会卡在「等人点同意」，但不再默认拿到全盘写权限；要 danger-full-access 必须自己显式配置。
         domainSessionPreset:
           rawConfig && rawConfig.domainSessionPreset !== undefined
             ? rawConfig.domainSessionPreset
-            : 'danger-full-access',
+            : 'workspace-write',
         // v0.6.0：新建域会话建完铺的模型（部署配置 > <home>/config.json > null＝不铺）。
         // 非法值在 resolveRuntime 里归一成 null，永不抛错。
         domainSessionModel: runtime.domainSessionModel,

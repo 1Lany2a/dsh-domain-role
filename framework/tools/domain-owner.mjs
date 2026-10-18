@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // domain-owner.mjs — 域名册（在任声明）命令行工具
-// 契约：D:\dsh\Generated\2026-10-10\域名册-接口约定.md  §1 存储 + §2 CLI
+// 契约：{数据根}\Generated\2026-10-10\域名册-接口约定.md  §1 存储 + §2 CLI
 // 只用 node:fs / node:os / node:path，零依赖。
 //
 // 设计要点：
@@ -577,7 +577,7 @@ function cmdCheck(argv) {
 // ---------------------------------------------------------------- 入口
 
 const USAGE = [
-  '域名册（在任声明）工具 —— 只维护 D:\\xiangmu\\_registry\\domains.json',
+  '域名册（在任声明）工具 —— 只维护 ' + REGISTRY_PATH,
   '',
   '  node domain-owner.mjs claim <域> --session <会话id> [--project <项目>] [--note <说明>] [--by <声明人>] [--force]',
   '  node domain-owner.mjs release <域> [--project <项目>]',

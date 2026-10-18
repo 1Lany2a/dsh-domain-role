@@ -5,7 +5,7 @@
 #                      Only main-session commits are allowed, gated by .main-writer-flag.
 #   Gate 2 (审计日志)  code changed but no projectlog/ audit log staged => block.
 #                      Added 2026-10-11 (提案 2026-10-09 §2.3). Switchable, see below.
-# See: D:\xiangmu\SYSTEM-OVERVIEW.md (唯一写者 rule)
+# See: {体系根}\SYSTEM-OVERVIEW.md (唯一写者 rule)
 #
 # Install: copy this file to <project>/.git/hooks/pre-commit
 #          then ensure it is executable (git on Windows runs it via bash)

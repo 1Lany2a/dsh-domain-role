@@ -10,9 +10,11 @@
 # （DSH_DOMAIN_BRIDGE_INDEX / _DOMAINS / _OWNER_CLI）→ <home> 默认文件名」四级解析；home 为空＝"0 个域"。
 # 想给某台机器钉死路径，写 <home>/config.json（字段 indexFile / domainsFile / ownerCli），别改这里。
 #
-# domainSessionPreset（v0.3.3）：create_domain_session 建完给新会话设的权限档。后台域会话无人值守，留在
-# 部署默认的 workspace-write + ask 会卡在「等一个人点同意」；可用 read-only / workspace-write /
-# danger-full-access，写 '' 或 none 即关闭这一步；单个调用可用参数 permissionPreset 覆盖。
+# domainSessionPreset（v0.3.3 / 缺省值 v0.6.4 收窄）：create_domain_session 建完给新会话设的权限档。
+# 后台域会话无人值守，留在部署默认的 workspace-write + ask 会卡在「等一个人点同意」；可用 read-only /
+# workspace-write / danger-full-access，写 '' 或 none 即关闭这一步；单个调用可用参数 permissionPreset 覆盖。
+# ⚠️ 安全默认：代码里的缺省值是 workspace-write。要 danger-full-access（全盘写 + 免审批）请**自己显式写**，
+#    或按单个调用传 permissionPreset——这等于把「信任这台机器上的全部内容」写在配置里。
 # stateDir（v0.4.0）：政策轴（暂停）＋ 队列的落盘目录，缺省 <home>/state（home 见上）；写 '' 也退回默认。
 - insert:
     - id: domain-bridge
@@ -20,4 +22,4 @@
       config:
         indexFile: ''
         domainsFile: ''
-        domainSessionPreset: 'danger-full-access'
+        domainSessionPreset: 'workspace-write'

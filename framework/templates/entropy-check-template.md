@@ -110,23 +110,25 @@ node {体系根}\tools\think-loss-scan.mjs
 
 ## 5. Generated 边界扫描（跨项目，顺跑；**不参与上面 4 项判级**。2026-10-08 按"产物落位约定"加）
 
-> **判据一句话**：**被活文档引用的东西，不许留在 `D:\dsh\Generated\`**。
-> 命中 ⇒ 按约定落位（备份/交付物/原型 → `D:\dsh\backups\{skills,templates,tools}\`；脚本 → `D:\dsh\tools\`；项目资产 → 该项目目录内），**旧目录留 `MOVED-TO.md` + 改活文档里的路径**，历史叙述不动。
+> **判据一句话**：**被活文档引用的东西，不许留在 `{数据根}\Generated\`**。
+> 命中 ⇒ 按约定落位（备份/交付物/原型 → `{数据根}\backups\{skills,templates,tools}\`；脚本 → `{数据根}\tools\`；项目资产 → 该项目目录内），**旧目录留 `MOVED-TO.md` + 改活文档里的路径**，历史叙述不动。
 > 为什么机械扫：这套边界**已经漏过两次**（2026-10-08 交接前才发现第 9 条；同日复核又发现 5 类），根因＝当时只按**人工清单**搬、没有可机械判定的标准。
+
+**先替换占位符再跑**：把下面代码里的 `{体系根}` / `{知识库}` / `{数据根}` 换成你机器上的真实目录（例如 `$env:DSH_SYSTEM_ROOT`、`$env:DSH_DATA_ROOT`，或直接写绝对路径）。**不替换就跑，A/B 两次扫描都会静默返回 0 条、且不报错**——别把"没输出"当成"没问题"。
 
 ```powershell
 # A) 活文档里引用的 Generated 路径：滤掉模板占位符/通配符，再标"在/缺"
 #    缺 = 断链（该补"已迁至"指针）；在 = 仍留在 Generated 的候选（按落位约定该搬走）
 $docs = Get-ChildItem '{体系根}','{知识库}',"$env:USERPROFILE\.dsh\skills" -Recurse -File -Include *.md,*.txt,*.mjs -ErrorAction SilentlyContinue
-$refs = $docs | Select-String -Pattern 'D:\\dsh\\Generated\\[^`\s"''）)]+' -AllMatches -Encoding utf8 |
+$refs = $docs | Select-String -Pattern '{数据根}\\Generated\\[^`\s"''）)]+' -AllMatches -Encoding utf8 |
         ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Sort-Object -Unique |
         Where-Object { $_ -notmatch '[<>*?…{}（）]' -and $_ -notmatch 'Generated\\?$' }
 $refs | ForEach-Object { $st='?'; try { $st = @('缺','在')[[int](Test-Path -LiteralPath $_)] } catch {}; "$st  $_" } | Sort-Object
 
 # B) Generated 里"长得像体系级东西"的文件（关键词粗筛，命中人工复核）
-Get-ChildItem 'D:\dsh\Generated' -Recurse -File -Force -ErrorAction SilentlyContinue |
+Get-ChildItem '{数据根}\Generated' -Recurse -File -Force -ErrorAction SilentlyContinue |
   Where-Object { $_.Name -match 'session-registry|dispatch-template|mission\.mjs|SYSTEM-|init-project|dsh-knowledge-base|call-local|vision-desc' } |
-  Select-Object @{n='路径';e={$_.FullName.Replace('D:\dsh\Generated\','')}}, @{n='KB';e={[math]::Round($_.Length/1KB,1)}} | Sort-Object 路径
+  Select-Object @{n='路径';e={$_.FullName.Replace('{数据根}\Generated\','')}}, @{n='KB';e={[math]::Round($_.Length/1KB,1)}} | Sort-Object 路径
 ```
 
 **口径**：A 的路径抽取是**粗筛**（正则截到分隔符/引号），`?` ＝路径含非法字符或抽取有误，命中后人工看一眼；B 的关键词表**刻意不含 `.bak`**（会把各项目自己的配置备份一起捞进来，那是项目侧的事）。

@@ -3,6 +3,16 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.6.4] — 2026-10-18
+
+安全默认收窄，无其它行为变化。
+
+- **`domainSessionPreset` 的代码缺省值由 `danger-full-access` 改为 `workspace-write`**：`create_domain_session` 建完给新会话设的权限档，不再默认给「全盘写 + 免审批」。要全盘写权限必须**显式**配置（`cordis.patch.yml` 的 `domainSessionPreset`，或单次调用传 `permissionPreset`）——这等于把「我信任这台机器上的全部内容」写进配置。
+- 同步改动的文字：`cordis.patch.yml` 的注释与默认值、README 的配置示例、`create_domain_session` 的工具描述（两处）。
+- **未改**：任何工具的入参、回执形状、判定逻辑；未新增依赖；未动暂停/队列/唤醒接线。
+
+验证：`node test/smoke.mjs` 仍是 **282 用例 / 54,624 断言**全通过（本次只动缺省值与描述文字，测试里没有对缺省值的断言）。
+
 ## [0.6.3] — 2026-10-18
 
 仅结构拆分，对外行为不变 —— 把单文件 `lib/bridge.js`（6,407 行 / 318,551 B）拆成 6 个模块，**入口仍是 `lib/bridge.js`**（只做汇总再导出：头部说明 + 12 行 `import` + 6 行 `export *` + `apply` 入口，共 107 行；`test/smoke.mjs` 的 import 路径一个字未改）：
