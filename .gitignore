@@ -1,0 +1,27 @@
+# 运行时与产物（不进版本库）
+
+## 依赖
+node_modules/
+.pnpm-store/
+
+## 插件运行期状态（外置在 ~/.dsh，这里再兜一层保险）
+state/
+*.jsonl
+
+## 日志
+projectlog/
+logs/
+*.log
+
+## 渲染产物（源是 .data.js，页是产物，删掉重跑能变回原样）
+_pages/*.html
+docs/**/*.png
+
+## 操作系统噪音
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## 编辑器
+.vscode/
+.idea/

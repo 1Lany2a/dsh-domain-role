@@ -1,0 +1,118 @@
+#!/bin/sh
+# pre-commit hook: two mechanical gates.
+#
+#   Gate 1 (唯一写者)  protect shared docs (PROJECT.md / KNOWLEDGE.md).
+#                      Only main-session commits are allowed, gated by .main-writer-flag.
+#   Gate 2 (审计日志)  code changed but no projectlog/ audit log staged => block.
+#                      Added 2026-10-11 (提案 2026-10-09 §2.3). Switchable, see below.
+# See: D:\xiangmu\SYSTEM-OVERVIEW.md (唯一写者 rule)
+#
+# Install: copy this file to <project>/.git/hooks/pre-commit
+#          then ensure it is executable (git on Windows runs it via bash)
+#
+# Main session usage: before committing shared docs, run:
+#   touch .main-writer-flag
+# The flag is auto-consumed on successful commit.
+#
+# Gate 2 switches (any one of them turns it off / bypasses it):
+#   touch .auditlog-skip                     # one commit; auto-consumed when the commit passes
+#   git config hooks.auditlog-gate false     # per repo, persistent
+#   AUDITLOG_GATE=0 git commit ...           # per command
+# A repo without a projectlog/ directory never sees gate 2 (convention not adopted yet).
+
+PROTECTED_PATTERN="^(PROJECT|KNOWLEDGE)\.md$"
+FLAG_FILE=".main-writer-flag"
+
+# --- gate 2 settings -------------------------------------------------------
+# "code" = the extensions this shop actually writes. Add freely; keep it one regex.
+CODE_PATTERN='\.(mjs|js|cjs|mts|ts|tsx|jsx|py|ps1|psm1|sh|bash|zsh|c|h|cc|cpp|hpp|cs|java|go|rs|rb|php|vue|sql|cmd|bat)$'
+AUDITLOG_DIR="projectlog"
+AUDITLOG_SKIP_FILE=".auditlog-skip"
+
+auditlog_gate_on() {
+  # explicit per-command switch wins
+  if [ "$AUDITLOG_GATE" = "0" ]; then return 1; fi
+  # per-repo switch: git config --bool prints "false" when turned off
+  CFG=$(git config --bool hooks.auditlog-gate 2>/dev/null)
+  if [ "$CFG" = "false" ]; then return 1; fi
+  # never enforce the convention where it was never adopted
+  if [ ! -d "$AUDITLOG_DIR" ]; then return 1; fi
+  return 0
+}
+
+# --- gate 1: shared docs ---------------------------------------------------
+# Get staged files (Added/Copied/Modified/Renamed)
+CHANGED=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$PROTECTED_PATTERN")
+
+if [ -n "$CHANGED" ]; then
+  if [ -f "$FLAG_FILE" ]; then
+    # Main-session flag present: allow. It is consumed only after every gate passed (bottom of the
+    # file), so a later block never burns the flag.
+    FLAG_SEEN=1
+  else
+    echo ""
+    echo "======================================================"
+    echo "  BLOCKED: shared doc modified outside main session"
+    echo "======================================================"
+    echo ""
+    echo "Files changed:"
+    echo "$CHANGED" | sed 's/^/  - /'
+    echo ""
+    echo "Rule: PROJECT.md / KNOWLEDGE.md can only be committed by"
+    echo "the main session (唯一写者规则)."
+    echo ""
+    echo "If you ARE the main session, create the flag file first:"
+    echo "  touch $FLAG_FILE"
+    echo "then re-run git commit. The flag is auto-consumed."
+    echo ""
+    echo "Otherwise: do not modify shared docs. Report via"
+    echo "project_map complete instead."
+    echo "======================================================"
+    exit 1
+  fi
+fi
+
+# --- gate 2: code changed => a projectlog/ audit log must be staged too ----
+if auditlog_gate_on; then
+  STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+  CODE=$(echo "$STAGED" | grep -Ei "$CODE_PATTERN")
+  if [ -n "$CODE" ]; then
+    # any staged Markdown audit log under projectlog/ counts (folder layout is the project's own)
+    LOGS=$(echo "$STAGED" | grep -E "^${AUDITLOG_DIR}/.*\.md$")
+    if [ -z "$LOGS" ]; then
+      if [ -f "$AUDITLOG_SKIP_FILE" ]; then
+        # explicit, single-commit bypass; consumed when the commit passes
+        SKIP_SEEN=1
+        echo "auditlog gate: bypassed by $AUDITLOG_SKIP_FILE (auto-consumed)."
+      else
+        echo ""
+        echo "======================================================"
+        echo "  BLOCKED: code changed without an audit log"
+        echo "======================================================"
+        echo ""
+        echo "Code files in this commit:"
+        echo "$CODE" | sed 's/^/  - /'
+        echo ""
+        echo "Rule (改代码必写审计日志): every commit that touches code"
+        echo "must also stage a Markdown audit log under $AUDITLOG_DIR/."
+        echo "Write down what changed, why, and what was tested (flat"
+        echo "prose is enough: entry / key branch / result, one TraceID)."
+        echo ""
+        echo "Bypass for ONE commit (use it only when the rule is really N/A):"
+        echo "  touch $AUDITLOG_SKIP_FILE     # then re-run git commit; auto-consumed"
+        echo "Turn the gate off for this repo:"
+        echo "  git config hooks.auditlog-gate false"
+        echo "Turn it off for one command:"
+        echo "  AUDITLOG_GATE=0 git commit ..."
+        echo "======================================================"
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+# every gate passed: NOW consume the flags
+if [ "$FLAG_SEEN" = "1" ]; then rm -f "$FLAG_FILE"; fi
+if [ "$SKIP_SEEN" = "1" ]; then rm -f "$AUDITLOG_SKIP_FILE"; fi
+
+exit 0

@@ -1,0 +1,43 @@
+{
+  "name": "dsh-domain-bridge",
+  "version": "0.6.3",
+  "description": "域可达层：声明优先的域寻址、会话工厂、四级「已暂停」、唤醒接线与模型分派。工具清单与口径见 README.md，变更史见 CHANGELOG.md。",
+  "type": "module",
+  "main": "lib/bridge.js",
+  "exports": {
+    ".": {
+      "default": "./lib/bridge.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "domain",
+    "session",
+    "orchestration",
+    "pause"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.0-rc.0 <0.3.0"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}

@@ -1,0 +1,23 @@
+# dsh-domain-bridge bundle patch — 域可达层（声明优先 + 会话工厂 + 四级「已暂停」 + 唤醒接线 + 模型分派）。
+# 安装：dsh plugin --profile desktop add link:<this-package-directory>
+# 工具清单与口径见 README.md；变更史与每个版本的读码依据/真机踩坑见 CHANGELOG.md。
+#
+# 硬边界（沿用体系口径）：不新建第二本台账。indexFile 只读，用于把「会话 id → 域」标出来；
+# domainsFile 是在任声明册（domain-owner.mjs 与 claim_domain/release_domain 共用同一份、同一 schema、
+# 同一原子替换写法）。两个文件读不到或格式坏掉都只降级，不影响投递。
+#
+# 下面两个路径写 '' ＝ 让代码按「部署配置 → <home>/config.json → 环境变量
+# （DSH_DOMAIN_BRIDGE_INDEX / _DOMAINS / _OWNER_CLI）→ <home> 默认文件名」四级解析；home 为空＝"0 个域"。
+# 想给某台机器钉死路径，写 <home>/config.json（字段 indexFile / domainsFile / ownerCli），别改这里。
+#
+# domainSessionPreset（v0.3.3）：create_domain_session 建完给新会话设的权限档。后台域会话无人值守，留在
+# 部署默认的 workspace-write + ask 会卡在「等一个人点同意」；可用 read-only / workspace-write /
+# danger-full-access，写 '' 或 none 即关闭这一步；单个调用可用参数 permissionPreset 覆盖。
+# stateDir（v0.4.0）：政策轴（暂停）＋ 队列的落盘目录，缺省 <home>/state（home 见上）；写 '' 也退回默认。
+- insert:
+    - id: domain-bridge
+      name: 'dsh-domain-bridge'
+      config:
+        indexFile: ''
+        domainsFile: ''
+        domainSessionPreset: 'danger-full-access'

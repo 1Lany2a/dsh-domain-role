@@ -1,0 +1,8 @@
+# runtime data — never tracked
+node_modules/
+state/
+
+# logs / OS noise
+projectlog/
+*.log
+.DS_Store
