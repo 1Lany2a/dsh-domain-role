@@ -396,7 +396,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.8.3', `package.json 版本不是 0.7.0（实际 ${pkg.version}）`)
+eq(pkg.version, '0.8.4', `package.json 版本不是 0.7.0（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -866,6 +866,12 @@ const createExec = { agent: sender }
   eq(out.claim, { requested: false, performed: false }, 'claim 回执不对')
   ok(out.hint.includes('不会把它翻到前台'), '成功 hint 里必须说明不能翻到前台')
   eq(created.sent.length, 1, '开工任务应排进去')
+  // v0.8.4：身份摘要随任务一起去；原文 task 一字不动跟在分隔线之后。
+  const taskText = created.sent[0].payload.content[0].text
+  ok(taskText.includes(out.taskIdentity), 'taskIdentity 应真的出现在发出去的正文里')
+  ok(taskText.includes('`misas:asr`'), '身份摘要里应带域键')
+  ok(taskText.includes('没有**认领'), '未认领时身份摘要必须说清「没有认领」')
+  ok(taskText.includes(out.taskIdentity + '\n\n---\n\ndo it'), '原文 task 必须一字不动地跟在分隔线之后')
 }
 
 {
@@ -905,6 +911,8 @@ const createExec = { agent: sender }
   eq(out.claim.outcome, 'claimed', 'claim.outcome 应为 claimed')
   eq(out.claim.owner.sessionId, ID.C, '新会话应成为负责人')
   eq(JSON.parse(fs.readFileSync(book, 'utf8')).owners['misas:asr'].sessionId, ID.C, '域名册没指向新会话')
+  ok(out.taskIdentity.includes('你是 `misas:asr` 的负责人'), '认领成功时身份摘要应直接说「你是负责人」')
+  ok(created.sent[0].payload.content[0].text.includes('\n\n---\n\nx\n\n（投递方式'), '原文 task 应原样保留')
 }
 
 {
@@ -921,6 +929,8 @@ const createExec = { agent: sender }
   eq(out.claim.outcome, 'conflict', 'claim.outcome 应为 conflict')
   ok(typeof out.claim.hint === 'string', 'claim 冲突必须给换人办法 hint')
   eq(out.claim.holder.sessionId, ID.B, 'claim.holder 不对')
+  ok(out.taskIdentity.includes('没有**认领'), '冲突时身份摘要不得谎称「你是负责人」')
+  ok(out.taskIdentity.includes('takeover'), '冲突时身份摘要应给 takeover 的接任办法')
 }
 
 {
