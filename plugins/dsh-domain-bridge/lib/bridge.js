@@ -112,17 +112,35 @@ export default {
       const commandDefs = buildCommandDefs(ctx, { config, defs, runInitialize })
       // 两个服务必须注入在**同一个子作用域**里：菜单路由的执行阶段还要用 commands（执行命令）
       // 与 agents（拿调用者），跨作用域取不到。
+      // v0.8.5 修根因：**这个回调必须 return 一个 disposer**。宿主只会收集 apply 的返回值；
+      // 以前两个 register* 的 disposer 全被丢掉 ⇒ 插件在同一个进程里重载（HMR/停用再启用/装新版）
+      // 时旧路由留在 webServer 的 exact 表里、新路由注册抛 duplicate 又被空 catch 吞掉，
+      // 结果是 /run 与 /health 永远打到**已经失效的旧实例**上（真机症状：/run 报
+      // `cannot get required service "commands" in inactive context`、/health 空体 400），
+      // 六条命令的弹窗点了什么都不发生，直到重启 dsh。
       ctx.inject(['commands', 'webServer'], (bridgeCtx) => {
+        const disposers = []
         try {
-          registerCommandDefinitions(bridgeCtx, commandDefs)
+          const dispose = registerCommandDefinitions(bridgeCtx, commandDefs)
+          if (typeof dispose === 'function') disposers.push(dispose)
         } catch (error) {
           warn(`command registration failed: ${error?.message || String(error)}`)
         }
         try {
-          registerMenuRoutes(bridgeCtx, { config, defs, runInitialize, commandDefs })
+          const dispose = registerMenuRoutes(bridgeCtx, { config, defs, runInitialize, commandDefs })
+          if (typeof dispose === 'function') disposers.push(dispose)
           warn('command menu routes registered (/api/dsh-domain-bridge/{health,menu,run})')
         } catch (error) {
           warn(`menu routes failed: ${error?.message || String(error)}`)
+        }
+        return () => {
+          for (const dispose of disposers) {
+            try {
+              dispose()
+            } catch {
+              /* a dispose failure must never block the rest */
+            }
+          }
         }
       })
       warn(

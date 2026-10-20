@@ -12,6 +12,7 @@ import { warn, tool } from './tools.js'
 import { loadInbox, domainEnvelope, domainMessage } from './messaging.js'
 import { pausedScopesWords, pausedTargetOf, pausedFactsOf, pausedCreateHint } from './pause.js'
 import { loadDeclarations, declarationInfo, splitDomainTarget, projectFromCwd, matchDeclaration, labelMatches, declareNewOwner, existingOwnerInfo, domainAlreadyOwnedHint, domainOwnedOverrideHint } from './declaration.js'
+import { readRegistrations, upsertRegistration } from './registrations.js'
 
 export function getSessionController(ctx) {
   try {
@@ -196,6 +197,13 @@ export function minuteStamp(date) {
 /** 形如 `[docs] 2026-10-12 23:30 · 一句话简介`：时间戳前置，简介吃剩下的字节预算。 */
 export function domainSessionTitle(domain, summary, date) {
   const prefix = '[' + String(domain ?? '域') + '] ' + minuteStamp(date) + ' · '
+  const budget = TITLE_MAX_BYTES - utf8Bytes(prefix)
+  return prefix + clipToBytes(summary, budget > 4 ? budget : 0)
+}
+
+/** 主会话层的标题：`【体系】2026-10-20 23:30 · 一句话` / `【项目】…`（不写成域的 `[system]` 形状）。 */
+export function mainLayerTitle(layer, summary, date) {
+  const prefix = (layer === 'system' ? '【体系】' : '【项目】') + minuteStamp(date) + ' · '
   const budget = TITLE_MAX_BYTES - utf8Bytes(prefix)
   return prefix + clipToBytes(summary, budget > 4 ? budget : 0)
 }
@@ -1468,7 +1476,14 @@ export function buildCreateSessionTool(ctx, config) {
     'create_domain_session',
     '**开一个新的顶层会话（域会话）并把一条开工任务排进去**。走宿主服务 `ctx.sessionController.create()`（dsh-api-session-controller/lib/index.js:686-714：**只要给 cwd 就够**；不给 sessionId 时宿主自己生成 `session-<uuid>`）。v0.3.2 起让这条会话**抬眼可见**：① 先按 cwd 在宿主 Workspace 注册表里找一个**已存在**的工作区（`resolveByPath`，纯读、**绝不新建分组**），命中就传 `{workspaceId}`（宿主会把它挂进那个分组），未命中或拿不到注册表就退回 v0.3.1 的 `{cwd}`；② 建完再 `pinSession(sessionId)` 把它**置顶**到它所属分组最上方。找不到的排障顺序：那个分组若**折叠**就先点组名展开（折叠组一行都不渲染），再不行用左侧栏**搜索框输 cwd 的目录名**，或把排序方式切成「最近更新」。**本工具仍不能把它翻到前台**——宿主侧根本没有 Host→Renderer 导航通道，只能由人点一下那一条（或由渲染层客户端插件代点）。**v0.3.3 起建完还会顺手做两件事**（都能单独关掉，失败只影响那一步、不影响 `created`）：① 把沙箱/审批档设成 `permissionPreset`（不给＝用配置 `domainSessionPreset`，缺省 `workspace-write`——后台域会话无人值守不该卡在「等人点同意」，但要全盘写权限必须自己显式配 `danger-full-access`）；② 把标题设成 `title`（不给＝自动生成「[域] 2026-10-12 23:30 · 任务首句」，时间戳前置、≤80 字节；命名会 pin 标题、之后不再有 LLM 自动标题，对域会话无损失——它的首条消息是插件投递的，本来就不触发自动命名）。参数：`domain`（必填，`asr` 或 `项目:域`）、`task`（必填，要排给新会话的纯文本任务）、`project?`（短名 domain 时补项目；缺省用本会话 cwd 的目录名小写）、`cwd?`（新会话的工作目录；缺省用调用方会话的 cwd；相对路径会被宿主进程按自身 cwd 解析，建议给绝对路径）、`claim?`（默认 false；true = 建完把该域的「在任声明」指向新会话；**该域已有别的负责人时不覆盖**，如实回报冲突并给出换人办法）、`allowExistingOwner?`（默认 false；**v0.3.6 起：无论 claim 与否，本工具都会先读域名册**，回执常带 `existingOwner`（谁在任 / 是否在线 / 是否还在会话索引里）。该域**已有负责人**、你又没传 `claim:true`、也没传 `allowExistingOwner:true` ⇒ **不建会话**，回 `{created:false, reason=domain-already-owned, existingOwner, hint}`——这是为了防止同一个域起两条活会话并发改同一批文档（2026-10-12 docs 域事故）；传 `true` ＝ 明知已有负责人仍要再开一条，回执会带 `warning=domain-already-owned`，风险自负）、`pin?`（默认 **true**；`false` = 跳过置顶）、`permissionPreset?`（可选：建完立刻给这个会话设的权限档名，`read-only`／`workspace-write`／`danger-full-access`；`none`/`keep`/`skip`/空 ＝ 不动）、`title?`（可选：标题原文；`none`/`keep`/`skip`/空 ＝ 不命名）、`dryRun?`（默认 false；true 只回报"将会建哪个 cwd 的会话、排什么任务"、将设什么标题与权限档，**绝不真建**）、`agentPreset?`（可选，逐字透传给宿主的 `agentPreset`）。**v0.6.0 模型分派**：`model?`（`{provider, model, reasoningEffort?}`）＝建完立刻给新会话铺的模型（宿主 `create` 不收模型参数 ⇒ 建完调 `selectModel`）；不给＝用配置 `domainSessionModel`；都没有＝继承全局默认（保持旧行为）。铺模型同样是「先记全局默认 → 改 → 恢复」，回执带 `modelApplied:{ok, provider, model, source, error?}`；建会话本身失败时**一个模型都不改**。任何一步失败都**不抛错**，一律回报 `{created:false, reason}`。****v0.4.0 起「已暂停」｜v0.4.2 推广到四级**：目标被**任一级**按下（`scope` 取 `domain` / `session`（主＝单会话）/ `project` / `global`，**OR 叠加**）时**直接拒绝**：`created:false` / `reason=domain-paused`（冻结的历史字面量）/ `pausedScopes` / `pausedByScopes` / `scope` / `derivedState`，并且**绝不调用宿主 create**（`dryRun` 也一样，只报告"会被拒绝"）——暂停期间不新开、也不唤醒，这正是"暂停"的意义。判定**两端都查**：接收端（将新建的那个域键 / 它的项目 / 它的负责人会话 / global）＋发送端（本会话 / 本会话的项目 / global）。恢复后再建：`set_domain_state(scope=…, domain=…, state=active)`。暂停**不改在任身份**（声明册里 sessionId 不动），它与下面 F1 的「已有负责人」是两条**独立**的闸，本工具**先判暂停、再判负责人**。',
     {
-      domain: { type: 'string', description: '域短名（asr）或「项目:域」（misas:asr）' },
+      layer: {
+        type: 'string',
+        description:
+          "可选（v0.8.5）：这条会话属于哪一层 —— `domain`（默认，域会话）/ `project`（项目主会话）/ `system`（体系主会话）。" +
+          '**主会话换届必须显式传 layer**：域层写 owners、主会话层写 registrations，两本账不同。' +
+          '不传＝`domain`，行为与以前逐字一致。',
+      },
+      domain: { type: 'string', description: '域短名（asr）或「项目:域」（misas:asr）。layer=system 时用「项目:system」，layer=project 时用「项目:main」（都给短名也行，按层规整）。' },
       task: { type: 'string', description: '要排给新会话的纯文本开工任务（以完整 v4 用户消息排进它的 inbox 并唤醒它开一轮）。v0.8.4 起插件会在它前面自动加一句**身份摘要**（「你是 `<项目>:<域>` 的负责人」或「你要接手它、当前在任 X」），原文一字不改跟在分隔线之后——新会话第一轮就知道自己是谁，不必先点 `/register`。' },
       model: {
         type: 'object',
@@ -1523,8 +1538,26 @@ export function buildCreateSessionTool(ctx, config) {
           modelSource = 'config'
         }
 
+        // ── v0.8.5：**层**。以前这个工具从骨子里只认「域」：参数表没有层、身份摘要说
+        // "你是 X 的负责人（域会话）"、认领只写 owners ⇒ 拿它做体系主换届时，新会话被告知去
+        // `/register domain tixiweihu:system`，也就永远拿不到 layer:'system'（拿不到 /pause global）。
+        // 现在三层：domain（默认，行为不变）/ project / system（主会话层写 registrations）。
+        const rawLayer = String(args.layer ?? '').trim().toLowerCase()
+        const layer = rawLayer === '' ? 'domain' : rawLayer
+        if (!['domain', 'project', 'system'].includes(layer)) {
+          return {
+            created: false,
+            reason: 'invalid-layer',
+            self,
+            hint: 'layer 只能是 domain / project / system（不传＝domain）。',
+          }
+        }
+        const isMainLayer = layer !== 'domain'
+
         const split = splitDomainTarget(rawDomain, args.project)
         if (split.error) return { created: false, reason: 'invalid-domain', error: split.error, self }
+        // 主会话层的键由层决定：体系 `<项目>:system`、项目 `<项目>:main`。
+        if (isMainLayer) split.domain = layer === 'system' ? 'system' : 'main'
 
         let project = split.project
         let projectFrom = '参数 / 「项目:域」完整写法'
@@ -1557,7 +1590,27 @@ export function buildCreateSessionTool(ctx, config) {
         } catch {
           rows = []
         }
-        const existingOwner = existingOwnerInfo(ctx, index, declarations, key, rows)
+        // ── v0.8.5：主会话层的「已有负责人」在**注册册**里，不在 owners 里。
+        // 只查 owners 的话，体系主换届这道 F1 闸形同虚设（同域能静默开第二条主会话）。
+        let existingOwner = existingOwnerInfo(ctx, index, declarations, key, rows)
+        if (isMainLayer) {
+          const regRead = readRegistrations(config.domainsFile)
+          const regDoc = regRead && regRead.doc ? regRead.doc : null
+          const regEntry = regDoc && regDoc.registrations ? regDoc.registrations[key] : null
+          const regOwner = regEntry && regEntry.sessionId ? String(regEntry.sessionId) : null
+          existingOwner = regOwner
+            ? {
+                sessionId: regOwner,
+                key,
+                layer,
+                since: regEntry.since ?? null,
+                note: regEntry.note ?? null,
+                live: rows.some((row) => row && row.sessionId === regOwner),
+                inArchive: true,
+                source: 'registrations',
+              }
+            : null
+        }
 
         // ── v0.4.0/v0.4.2：暂停拦截，**排在 F1 之前**——「暂停期间不新开、也不唤醒这个域」是更强的政策；
         // 而且"目标已被按下"这个事实，比"这个域已经有负责人"更该挡在建会话前面。
@@ -1654,8 +1707,16 @@ export function buildCreateSessionTool(ctx, config) {
         // 不带这一句，它第一轮就得先猜"我是不是负责人"，或者等人点一次 `/register`。
         // 这一句在**建会话之前**就定（只用 existingOwner + claim 请求），所以 dryRun 预览的也是真实文本；
         // 原文 task 一字不动放在分隔线之后（标题仍按原文首行算，调用点在本段之前）。
-        const identityHeader =
-          args.claim === true && !(existingOwner && existingOwner.sessionId)
+        const layerWordOf = (value) => (value === 'system' ? '体系主会话' : value === 'project' ? '项目主会话' : '域会话')
+        const identityHeader = isMainLayer
+          ? args.claim === true && !(existingOwner && existingOwner.sessionId)
+            ? `你是 \`${key}\` 的**${layerWordOf(layer)}**。本次建会话时已写入注册册的 \`registrations\` 节；裸跑 \`/register\` 可核对。`
+            : existingOwner && existingOwner.sessionId
+              ? `你是 \`${key}\` 的**${layerWordOf(layer)}**；本次建会话时接手自 ${existingOwner.sessionId}（已写进 note 留痕）。` +
+                `裸跑 \`/register\` 可核对。⚠️ 前任不会自动退役：要它退下来，需要人在它窗口里执行 \`/retire\`。`
+              : `你是 \`${key}\` 的**${layerWordOf(layer)}**。本次建会话时**没有**写注册册（调用方没传 claim）；` +
+                `裸跑 \`/register\` 看身份，要登记就 \`/register ${layer}\`。`
+          : args.claim === true && !(existingOwner && existingOwner.sessionId)
             ? `你是 \`${key}\` 的负责人（域会话）。本次建会话时已认领，域名册会把该域指向本会话；裸跑 \`/register\` 可核对。`
             : existingOwner && existingOwner.sessionId
               ? `你要接手的是 \`${key}\`；该域当前在任 ${existingOwner.sessionId}，本次**没有**认领它。先裸跑 \`/register\` 核对身份，要正式接任就 \`/register domain ${key} takeover\`。`
@@ -1665,7 +1726,7 @@ export function buildCreateSessionTool(ctx, config) {
           text: `${identityHeader}\n\n---\n\n${task}`,
           replyKey,
           mode: 'followup',
-          label: '域会话开工任务',
+          label: isMainLayer ? `${layerWordOf(layer)}交接任务` : '域会话开工任务',
         })
         const claimNote = `由 ${self.id ?? '未知会话'} 建会话时认领`
 
@@ -1709,7 +1770,10 @@ export function buildCreateSessionTool(ctx, config) {
         const presetWanted = offSwitch(rawPreset) ? null : String(rawPreset).trim()
         const titleWanted =
           args.title === undefined || args.title === null
-            ? domainSessionTitle(split.domain, task, new Date())
+            ? isMainLayer
+              // 主会话层的默认标题不写「[system]」——那是域的形状，侧栏里看不出它是体系主/项目主。
+              ? mainLayerTitle(layer, task, new Date())
+              : domainSessionTitle(split.domain, task, new Date())
             : offSwitch(args.title)
               ? null
               : clipToBytes(args.title, TITLE_MAX_BYTES)
@@ -1959,7 +2023,23 @@ export function buildCreateSessionTool(ctx, config) {
         }
 
         let claim = { requested: args.claim === true, performed: false }
-        if (args.claim === true) {
+        if (args.claim === true && isMainLayer) {
+          // 主会话层写**注册册**（不写 owners）——这是 identityOf 判定 layer:'system'/'project' 的唯一来源。
+          // 只有调用方明确 allowExistingOwner（＝`/handoff` 那种"明知有人在任仍要交接"）才覆盖，
+          // 覆盖时 upsertRegistration 会把前任写进 note 留痕。
+          const written = upsertRegistration(
+            config.domainsFile,
+            { key, layer, project, sessionId, note: claimNote },
+            { force: allowExistingOwner === true, by: self.id ?? null },
+          )
+          claim = { requested: true, layer, ...written }
+          if (written.conflict) {
+            const holderShort = shortId(written.owner?.sessionId) || written.owner?.sessionId || '（未记录）'
+            claim.hint =
+              `该键已有在任负责人 ${holderShort}，本次没有覆盖。要让**新会话 ${short}** 接手：` +
+              `① 让在任方自己在窗口里执行 \`/retire\`，再重跑本工具；② 或重跑时传 allowExistingOwner:true（＝强制接手，前任写进 note 留痕）。`
+          }
+        } else if (args.claim === true) {
           const result = declareNewOwner(config.domainsFile, {
             key,
             project,
@@ -2019,6 +2099,7 @@ export function buildCreateSessionTool(ctx, config) {
             cwd,
             project,
             projectFrom,
+            layer,
             domain: split.domain,
             key,
             agentPreset: created?.agentPreset ?? agentPreset ?? null,

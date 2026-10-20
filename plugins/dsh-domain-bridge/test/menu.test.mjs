@@ -46,12 +46,26 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(out.options.every((o) => typeof o.label === 'string' && o.label.length > 0), '每个选项都要有 label')
 }
 
-// 2. pause menu reflects missing authority instead of hiding it
+// 2. pause menu reflects missing authority instead of hiding it（v0.8.5 起多了「按域」一组）
 {
   const out = buildMenuOptions(ctx, deps, { command: 'pause', sessionId, cwd })
-  ok(out.options.length === 3, 'pause 菜单应是三档')
+  const ids = out.options.map((o) => o.id)
+  ok(ids.includes('domain qidongchengxu:asr'), 'pause 菜单应列出可暂停的域')
+  ok(ids.includes('self') && ids.includes('project') && ids.includes('global'), 'pause 菜单仍要有 self/project/global')
   const project = out.options.find((o) => o.id === 'project')
   ok(project && project.detail.includes('会被拒绝'), '无身份时项目档应如实说明会被拒绝')
+  const domainRow = out.options.find((o) => o.id === 'domain qidongchengxu:asr')
+  ok(!domainRow.confirmation, '按域暂停是可逆动作，不需要确认')
+}
+
+// 2b. v0.8.5（菜单 A）：所有行都要带分组标题，且除「新域」那条提示外都是可直接执行的动作
+{
+  for (const command of ['register', 'initialize', 'handoff', 'retire', 'pause', 'pause-all']) {
+    const out = buildMenuOptions(ctx, deps, { command, sessionId, cwd })
+    ok(out.ok === true, `${command} 菜单应成功`)
+    ok(out.options.length > 0, `${command} 菜单不能为空`)
+    ok(out.options.every((o) => o.group && typeof o.group.label === 'string'), `${command} 每一行都要有分组标题`)
+  }
 }
 
 // 3. pause-all asks for confirmation on project/global

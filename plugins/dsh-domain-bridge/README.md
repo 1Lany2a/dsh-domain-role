@@ -1,6 +1,6 @@
 # dsh-domain-bridge
 
-**域可达层 v0.8.3**（v0.7.0 起新增**六条斜杠命令**、v0.8 起带**弹窗菜单**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
+**域可达层 v0.8.5**（v0.7.0 起新增**六条斜杠命令**、v0.8 起带**弹窗菜单**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
 
 > v0.4.2 一句话：**任一级被按下就拦，拦的时候把「是哪几级按的」全部说出来；解一级不够——得把压着目标的那几级都解开，才会重投。**
 
@@ -30,7 +30,7 @@
 | `set_model` | **（v0.6.0 新增）改一个会话的模型，下一轮请求生效**。`target` 缺省＝调用者自己，可写会话 id 或域键；执行顺序固定：**记全局默认 → `selectModel` → 恢复全局默认**，回执 `{ok, sessionId, target, applied:"next-request", previous, globalDefault:{before, after, restored}}`。宿主失败码原样带回；恢复失败如实写 `restored:false` + error。 |
 | `set_default_model` | **（v0.6.1 新增）显式改宿主的全局默认模型，且永不恢复**（与 `set_model` 相反）。`{provider, model, reasoningEffort?}`；实现＝读 `before` → `ctx.agentDefaultModel.saveSelection(next)` → 读 `after`。影响面：**之后新建的、且尚无会话级选择的 Agent**；回执 `{ok, before, after, source:"agentDefaultModel", note, saved, verified, applied}`——宿主在没有部署配置入口/`configEditor` 时 `saveSelection` 是**静默 no-op**，所以读回来不一致就如实报 `verified:false` / `applied:"not-observed"`，绝不假装成功。服务不可用 ⇒ `api-unavailable`，参数非法 ⇒ `invalid-model`。 |
 
-## 斜杠命令（v0.7.0 起；v0.8.0 起带弹窗菜单）
+## 斜杠命令（v0.7.0 起；v0.8.0 起带弹窗菜单；v0.8.5 起菜单**零键入**、二三级选项由宿主侧状态算出）
 
 六条宿主命令，命令体**只做编排**（转调上面的工具定义，没有第二套实现、也不经过模型）：
 
@@ -45,7 +45,7 @@
 
 **顺序约定：注册在前、初始化在后。** 注册键就是 cwd 目录名，初始化的产出**不参与**推导——所以空目录（新建项目 / 新体系根）也能先注册，`/initialize` 随后把骨架建起来。只有 `/register system` 在目录里没有 `SYSTEM-OVERVIEW.md` 时要一次显式确认（`--confirm`）：自封体系主会拿到 `/pause global` 权限，值得按一下。
 
-**弹窗菜单**：浏览器半边（`lib/client.js`）用 `commandUi.decorate` 给这六条命令挂 `popupSelect`——输入 `/`、选中命令就能点选参数，不用背语法。菜单**在宿主侧按真实状态算**（`POST /api/dsh-domain-bridge/{health,menu,run}`，仅本机可访问），危险动作（接管域、退役、强停、全盘写交接）带二次确认；选完走 `ctx.commands.execute`，回执作为命令流转节点留在会话里。
+**弹窗菜单**：浏览器半边（`lib/client.js`）用 `commandUi.decorate` 给这六条命令挂 `popupSelect`——输入 `/`、选中命令就能点选参数，不用背语法。菜单**在宿主侧按真实状态算**：每条命令的选项按分组列出（身份／体系层／项目层／域层／参数／紧急），需要再确认的动作走宿主原生确认浮层 ⇒ **人只用点，不用打字**（唯一例外是"开一个全新的域"要给它一个名字）（`POST /api/dsh-domain-bridge/{health,menu,run}`，仅本机可访问），危险动作（接管域、退役、强停、全盘写交接）带二次确认；选完走 `ctx.commands.execute`，回执作为命令流转节点留在会话里。
 
 **注册册**：写在 `_registry/domains.json` 的平行节 `registrations`（`owners` 一字不动，域声明仍在 `owners`）。写盘全程持 `wx` 独占锁 + 唯一临时文件——固定名 `.tmp` 且无锁时，两进程并发各写 30 键最终只剩 2~12 个（静默丢写）。
 

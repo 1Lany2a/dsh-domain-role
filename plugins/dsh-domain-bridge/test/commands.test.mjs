@@ -109,15 +109,17 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(fs.existsSync(audit) && fs.readFileSync(audit, 'utf8').includes('pause-all'), '审计必须落盘')
 }
 
-// 11. /handoff defaults follow the frozen parameter table
+// 11. /handoff：按层建会话、显式 claim，模型与权限档交给部署配置（不再硬编码）
 {
   calls.length = 0
   const out = await run('handoff', '')
   caseOk(out.kind === 'success', '/handoff 应成功')
   const args = calls.find((c) => c[0] === 'create')?.[1]
-  caseOk(args && args.model.provider === 'wb' && args.model.model === 'cn:deepseek-v4.1-flash', '默认模型应为 wb/cn:deepseek-v4.1-flash')
-  caseOk(args.agentPreset === 'standard', '无注册身份时按项目档 standard')
-  caseOk(args.permissionPreset === 'workspace-write', '项目档权限应为 workspace-write')
+  caseOk(args && args.layer === 'project', '无注册身份时应按项目层建会话')
+  caseOk(args && args.claim === true, '交接必须显式 claim（把在任身份转给新会话）')
+  caseOk(args && args.model === undefined, '默认不再硬编码模型（交给 domainSessionModel 配置）')
+  caseOk(args && args.permissionPreset === undefined, '默认不再硬编码权限档（交给 domainSessionPreset 配置）')
+  caseOk(args.agentPreset === 'standard', '项目层默认 preset 仍为 standard')
 }
 
 // 12. /retire drops own registration and pauses the session
@@ -131,6 +133,27 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(out.text.includes('退役≠删除'), '退役回执必须写明不删除历史')
 }
 
+// 12.5 /pause domain：不存在的域必须被拒；域负责人可按下（按域暂停是 v0.8.5 新增的层级）
+{
+  const missing = await run('pause', 'domain nope:asr')
+  caseOk(missing.kind === 'error' && missing.text.includes('没有可暂停的域'), '不存在的域应被拒绝')
+
+  const doc = readRegistrations(domainsFile).doc || {}
+  doc.owners = doc.owners || {}
+  doc.owners['other:asr'] = { project: 'other', domain: 'asr', sessionId: 'session-other', since: new Date().toISOString(), note: '' }
+  fs.writeFileSync(domainsFile, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+
+  const denied = await run('pause', 'domain other:asr')
+  caseOk(denied.kind === 'error' && denied.text.includes('拒绝暂停这个域'), '不是负责人/项目主时应被拒绝')
+
+  calls.length = 0
+  doc.owners['other:asr'].sessionId = 'session-test'
+  fs.writeFileSync(domainsFile, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+  const allowed = await run('pause', 'domain other:asr')
+  caseOk(allowed.kind === 'success', '域负责人应能按下自己那个域')
+  caseOk(calls[0][1].scope === 'domain' && calls[0][1].domain === 'other:asr', '应按 domain 级暂停该键')
+}
+
 // 13. 体系主：带 --confirm 即可在缺骨架的目录注册；有 SYSTEM-OVERVIEW.md 后不再要确认
 {
   const after = await run('register', 'system --confirm')
@@ -141,6 +164,31 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   fs.writeFileSync(path.join(cwd, 'SYSTEM-OVERVIEW.md'), '# marker\n', 'utf8')
   const again = await run('register', 'system')
   caseOk(again.kind === 'success', '有体系口径源后应免确认注册')
+}
+
+// 14. 体系主身份下 /handoff 必须按体系层建会话（这是主会话换届的根因修复）
+{
+  calls.length = 0
+  const out = await run('handoff', '')
+  caseOk(out.kind === 'success', '体系主交接应成功')
+  const args = calls.find((c) => c[0] === 'create')?.[1]
+  caseOk(args.layer === 'system', '体系主交接应按 system 层建会话')
+  caseOk(args.domain === 'tixiweihu:system', '体系主交接应指向该体系的注册键')
+  caseOk(args.claim === true, '体系主交接必须 claim（写注册册，不是 owners）')
+  caseOk(String(args.title).startsWith('【体系】'), '体系主接任标题应带【体系】前缀')
+}
+
+// 15. /register project --takeover：真的强制接手（旧文案承诺过、代码没实现）
+{
+  upsertRegistration(domainsFile, { key: 'other:main', layer: 'project', project: 'other', domain: 'main', sessionId: 'session-other', since: new Date().toISOString(), by: 'session-other', title: '', note: '' })
+  const refused = await run('register', 'project other')
+  caseOk(refused.kind === 'error' && refused.text.includes('--takeover'), '冲突时应指出 --takeover 这条路')
+  const forced = await run('register', 'project other --takeover')
+  caseOk(forced.kind === 'success', '--takeover 应真的覆盖')
+  const doc = readRegistrations(domainsFile).doc
+  caseOk(doc.registrations['other:main'].sessionId === 'session-test', '覆盖后应指向本人')
+  caseOk(String(doc.registrations['other:main'].note).includes('session-other'), '前任必须写进 note 留痕')
+  caseOk(!doc.registrations['--takeover:main'], '--takeover 不能被当成项目名写成脏键')
 }
 
 console.log(`[commands] 用例 ${passed} 条全部通过`)

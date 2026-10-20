@@ -3,6 +3,56 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.5] — 2026-10-20
+
+**两件事一起修：主会话换届被当成域会话换届 ＋ 六条命令的弹窗点了没反应。**
+
+### 一、主会话换届（根因：这个工具从骨子里只认「域」）
+
+`create_domain_session` 以前没有"层"的概念：参数表没有 layer、身份摘要一律自称「你是 X 的负责人（域会话）」、认领只写 `owners`、防重复只查 `owners`。于是拿它做体系主换届时：
+
+- 新会话收到的摘要把它引去 `/register domain tixiweihu:system` ⇒ 体系键被登记成"域"；
+- 认领写进 `owners` ⇒ `identityOf` 只认 `layer:'domain'` ⇒ 新体系主拿不到 `layer:'system'`，`/pause global` 直接无权；
+- `existingOwner` 只查 `owners` ⇒ 对已注册的体系主完全不可见，同键能静默开第二条。
+
+- **加 `layer` 参数**（`domain` 默认 / `project` / `system`）。不传＝domain，行为与以前逐字一致。
+- **按层选账本**：域层写 `owners`（不变）；主会话层写 `registrations`（这才是 `identityOf` 判层的来源）。
+- **按层出身份摘要与信封标签**：主会话层说「你是 `<键>` 的**体系主会话/项目主会话**」，标签是「体系主会话交接任务」/「项目主会话交接任务」；域层文案与标签一字未改。
+- **按层查重**：主会话层的 F1 闸改查 `registrations`，不再对已注册的主会话睁眼瞎。
+- **按层标题**：主会话默认标题改成 `【体系】2026-10-20 23:30 · …` / `【项目】…`，不再是看起来像域的 `[system] …`。
+- **`/handoff` 按层传参**：显式传 `layer` + `claim:true`（把在任身份转给新会话），前任写进 note 留痕；并**删掉硬编码的 `wb/cn:deepseek-v4.1-flash` 与 `danger-full-access`**——它们会悄悄盖掉部署里的 `domainSessionModel` / 已收窄的 `domainSessionPreset`。
+
+### 二、六条命令的弹窗点了没反应（根因：路由生命期）
+
+`bridge.js` 的 `ctx.inject([...], cb)` 回调**没有 return disposer**，宿主只收集 apply 的返回值 ⇒ 插件在同一进程里重载（HMR / 停用再启用 / 装新版）后，旧路由留在 `webServer` 的 exact 表里，新路由注册抛 `duplicate` 又被 `menu.js` 的空 `catch` 吞掉 ⇒ 表里永远是**失效实例**的 handler。真机症状：`/run` 返回 `cannot get required service "commands" in inactive context`、`/health` 空体 400，六个菜单点下去什么都不发生。
+
+- **修**：`inject` 回调 return 统一 disposer（命令注册 + 三条路由一起撤）。
+- **修**：重复路由**不再静默**——打警告并写明"多半是上一次实例占位、重启可清"。
+- **修**：取服务统一走 `serviceOf()`（先 `ctx.get`、再属性读，两条路都不许抛）。`/health` 整体包 try，坏掉时回 `{ok:false,error}` 而不是自己 400。
+- **修**：`commands.execute` 抛错时**回落到 in-process handler**（动作照做），不再把整条命令变成失败。
+- **修**：客户端 `onSelect` 不再丢掉 `/run` 的回复——失败就抛出去，让弹窗的错误态接住。
+
+### 三、菜单 A：零键入（二三级选项）
+
+菜单全部改成**宿主侧按真实状态算出的分组行 + 原生确认浮层**，人只点不打字：
+
+- `/register`：身份只读 · 体系层 · 项目层 · 域层（每个已有域一行；自己是负责人的显示"刷新在任时间"，别人的显示"接手 + 确认浮层"）· 新域（唯一还需输入名字的一行）
+- `/initialize`：只读检查 / 补全骨架（带确认，列出将建 6 项）
+- `/handoff`：交给谁（按你当前身份显示"体系主/项目主/域"）· 参数覆盖（创造/标准/全盘写，全盘写带确认）
+- `/retire`：退役当前会话（确认浮层，说明撤几条注册、释放几个域）
+- `/pause`：按域（每域一行）· 按会话 · 按项目（带确认）· 全局（带确认）
+- `/pause-all`：单会话 / 项目 / 全局（后两者带确认）
+
+配套新增 `/pause domain <项目:域>`（菜单里"按域"要有能真跑的命令接住）：该域负责人、项目主、体系主可按下；域名册里没有这个域时明确拒绝。
+
+### 四、顺手修的两处承诺落空
+
+- `/register system|project --takeover` **真的实现了**（以前回执建议它、代码不解析，照做只会再撞一次冲突；`--takeover` 还会被当成项目名写出 `--takeover:main` 脏键）。
+- `/handoff` 现在如实回报"在任身份是否真的转成了"，不再一律说"前任还没退役"。
+
+### 验证
+
+`smoke` 283 / 55,148 断言 · `commands` 47 · `menu` 39 · `lifecycle` 15（新增）· `bootstrap` 16/121 · `registrations` 13/175 —— 全过。新增护栏：`create/layer-system`（写注册册、摘要说体系主、标签不叫域会话、标题【体系】）、菜单分组与零键入、路由 disposer 与重复路由告警、失效 ctx 下 `/health` 仍回 200、`/run` 回落执行。
 ## [0.8.4] — 2026-10-20
 
 **降摩擦：身份摘要随开工任务一起去。** `create_domain_session` 以前只把 `task` 原文排给新会话——而域身份只存在域名册（`owners`）里，新会话**自己看不见**，第一轮要么先猜"我是不是负责人"，要么等人点一次 `/register` 才知道。现在建会话时在 `task` 前面自动加一句身份摘要（原文一字不改，放在 `---` 分隔线之后）：

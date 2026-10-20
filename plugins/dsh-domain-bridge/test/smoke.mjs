@@ -396,7 +396,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.8.4', `package.json 版本不是 0.7.0（实际 ${pkg.version}）`)
+eq(pkg.version, '0.8.5', `package.json 版本不对（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -5008,6 +5008,31 @@ const SET_DEFAULT_NOTE = '影响之后新建的、且尚无会话级选择的 Ag
   eq(out.beforeError, 'smoke: currentSelection exploded', 'beforeError 应如实带原因')
   eq(out.afterError, 'smoke: currentSelection exploded', 'afterError 也应如实带原因')
   eq(fixture.calls.filter((item) => item.kind === 'saveSelection').length, 1, '写入仍应发生')
+}
+
+// ── v0.8.5（主会话换届）：layer=system 必须写**注册册**、按层出身份摘要与信封标签，
+// 且不再把新会话引去 /register domain —— 这就是「主会话换届被当成域会话换届」的根因回归。
+{
+  const book = bookFile('v085-system-layer', {})
+  const created = makeAgent('session-sys0001')
+  const controller = { create: async () => ({ sessionId: 'session-sys0001', agentPreset: 'cordis' }) }
+  const out = await call(
+    mount({ controller, get: (id) => (id === 'session-sys0001' ? created : undefined), domainsFile: book }),
+    'create_domain_session',
+    { layer: 'system', domain: 'tixiweihu:system', task: '接手体系', claim: true },
+    createExec,
+    'create/layer-system',
+  )
+  eq(out.created, true, '体系层应建成功')
+  eq(out.session.layer, 'system', 'layer 应如实回报')
+  ok(out.taskIdentity.includes('体系主会话'), '身份摘要必须说「体系主会话」，不能叫域负责人')
+  ok(!out.taskIdentity.includes('/register domain'), '主会话的身份摘要不能再把新会话引去 /register domain')
+  const text = created.sent[0].payload.content[0].text
+  ok(text.includes('体系主会话交接任务'), '信封标签应是主会话交接任务，不是域会话开工任务')
+  const doc = JSON.parse(fs.readFileSync(book, 'utf8'))
+  eq(doc.registrations['tixiweihu:system'].sessionId, 'session-sys0001', '体系层必须写 registrations')
+  ok(!(doc.owners || {})['tixiweihu:system'], '体系层不该写 owners（那是域的账本）')
+  ok(String(out.titled.title || '').startsWith('【体系】'), '默认标题应带【体系】前缀')
 }
 
 console.warn = realWarn

@@ -61,11 +61,18 @@ window.__ModuleLoader__.load({
                       return Array.isArray(result.options) ? result.options : []
                     },
                     async onSelect(option, session) {
-                      await post('run', {
+                      // v0.8.5：**回执不再被丢掉**。以前这里 `await post(...)` 就当完了，/run 失败
+                      // （例如插件实例失效时返回 kind:'error'）在界面上一个字都不显示——用户只看到
+                      // "点了没反应"。现在失败就抛出去，让弹窗自己的错误态/重试按钮接住。
+                      const outcome = await post('run', {
                         command: spec.name,
                         sessionId: sessionIdOf(session),
                         input: option && option.id != null ? String(option.id) : '',
                       })
+                      if (outcome && outcome.ok === false) {
+                        throw new Error(outcome.text || `${spec.name}: 执行失败`)
+                      }
+                      return outcome
                     },
                   },
                 })

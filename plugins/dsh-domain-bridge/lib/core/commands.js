@@ -160,8 +160,9 @@ function registerCommand(ctx, deps) {
         // 顺序约定：注册在前、初始化在后。缺 SYSTEM-OVERVIEW.md 时不再拒绝（那正是"新体系根还没建骨架"
         // 的正常状态），改成要一次显式确认——自封体系主是高权限动作，值得按一下；但卡住流程不值得。
         const isSystemRoot = projectOfCwd(cwd).isSystemRoot
+        const takeover = tokens.slice(1).some((token) => token === 'takeover' || token === '--takeover')
         const confirm = tokens.slice(1).some((token) => token === '--confirm' || token === 'confirm')
-        if (!isSystemRoot && !confirm) {
+        if (!isSystemRoot && !confirm && !takeover) {
           return reply(false, [
             `cwd 里没有体系口径源 SYSTEM-OVERVIEW.md：${cwd}`,
             '若这就是新建的体系根（骨架还没建），确认一次即可注册：',
@@ -175,11 +176,14 @@ function registerCommand(ctx, deps) {
           project,
           domain: 'system',
           cwd,
-        }, { skeletonMissing: !isSystemRoot })
+        }, { skeletonMissing: !isSystemRoot }, { force: takeover })
       }
 
       if (layer === 'project') {
-        const project = (tokens[1] || projectNameOf(cwd) || '').toLowerCase()
+        // v0.8.5：`--takeover` 以前会被当成项目名（键落成 `--takeover:main` 的脏数据）。
+        const takeover = tokens.slice(1).some((token) => token === 'takeover' || token === '--takeover')
+        const positional = tokens.slice(1).filter((token) => !token.startsWith('--') && token !== 'takeover' && token !== 'confirm')
+        const project = (positional[0] || projectNameOf(cwd) || '').toLowerCase()
         if (!project) return reply(false, ['推不出项目名：cwd 拿不到，也没传项目名。用法：`/register project <项目名>`。'])
         // 注册在前、初始化在后：不再要求项目根先有 PROJECT.md（新目录默认是空的）。
         // 仍保留「把 cwd 规整到项目根」——防止在子目录里注册，键必须落在项目根目录名下。
@@ -190,7 +194,7 @@ function registerCommand(ctx, deps) {
           project,
           domain: 'main',
           cwd: root,
-        }, { skeletonMissing: !root || !fs.existsSync(path.join(root, 'PROJECT.md')) })
+        }, { skeletonMissing: !root || !fs.existsSync(path.join(root, 'PROJECT.md')) }, { force: takeover })
       }
 
       if (layer === 'domain') {
@@ -219,19 +223,21 @@ function maybeProjectRoot(cwd, project) {
   return fs.existsSync(candidate) ? candidate : null
 }
 
-function writeRegistration(config, sessionId, entry, extra = {}) {
+function writeRegistration(config, sessionId, entry, extra = {}, opts = {}) {
   const written = upsertRegistration(config.domainsFile, {
     ...entry,
     sessionId,
     since: new Date().toISOString(),
     by: sessionId,
     title: '',
-    note: '',
-  })
+    note: opts.force ? 'takeover via /register' : '',
+  }, { force: opts.force === true, by: sessionId })
   if (written.ok) {
+    const fromHandover = written.handoverFrom || null
     return reply(true, [
       `✅ 已注册：**${entry.key}**（${layerWord(entry.layer)}）`,
       `· 会话：${sessionId}`,
+      ...(fromHandover ? [`· 接手自：${fromHandover}（已写进 note 留痕；它不是被停掉，需要的话让它自己 \`/retire\`）`] : []),
       `· 落账：${config.domainsFile} 的 \`registrations\` 节（owners 没动）`,
       // 顺序约定：注册先行，骨架后补。缺骨架不是失败，只是下一件事还没做。
       extra.skeletonMissing
@@ -246,8 +252,8 @@ function writeRegistration(config, sessionId, entry, extra = {}) {
     return reply(false, [
       `❌ \`${entry.key}\` 已经有负责人：${owner && owner.sessionId ? owner.sessionId : '(读不到)'}（自 ${owner && owner.since ? owner.since : '?'}）`,
       '三条出路：',
-      `· **交接**：让对方会话执行 \`/retire\`（或你自己 \`/register ${entry.layer} --takeover\`——v1 暂不支持，会覆盖不了）`,
-      '· **另开身份**：换一个项目名（`/register project <另一个项目>`）',
+      `· **强制接手**：\`/register ${entry.layer} --takeover\`（会把对方写进 note 留痕；它不会被停掉）`,
+      '· **对方自己退**：让在任会话执行 `/retire`，你再重跑这条注册',
       '· **取消**：什么都不做',
     ])
   }
@@ -324,12 +330,17 @@ function handoffCommand(ctx, deps) {
       const layer = identity.roles.length ? identity.roles[0].layer : 'project'
       const key = identity.roles.length ? identity.roles[0].key : `${projectNameOf(cwd) || 'unknown'}:main`
 
-      const modelValue = parsed.values.get('model') || `${HANDOFF_DEFAULTS.model.provider}/${HANDOFF_DEFAULTS.model.model}`
-      const slash = modelValue.indexOf('/')
-      if (slash <= 0) return reply(false, [`model 要写成 provider/model，例如 \`wb/cn:deepseek-v4.1-flash\`；收到：${modelValue}`])
-      const model = { provider: modelValue.slice(0, slash), model: modelValue.slice(slash + 1) }
+      const modelValue = parsed.values.get('model') || null
+      let model = null
+      if (modelValue) {
+        const slash = modelValue.indexOf('/')
+        if (slash <= 0) return reply(false, [`model 要写成 provider/model，例如 \`wb/cn:deepseek-v4.1-flash\`；收到：${modelValue}`])
+        model = { provider: modelValue.slice(0, slash), model: modelValue.slice(slash + 1) }
+      }
       const preset = parsed.values.get('preset') || HANDOFF_DEFAULTS.presets[layer] || 'standard'
-      const perm = parsed.values.get('perm') || HANDOFF_DEFAULTS.permission[layer] || 'workspace-write'
+      // v0.8.5：权限档**默认跟随部署配置**（config.domainSessionPreset），不再在这里硬编码
+      // danger-full-access —— 硬编码会悄悄盖掉 v0.6.4 把默认收窄到 workspace-write 的安全意图。
+      const perm = parsed.values.get('perm') || null
       const target = parsed.values.get('target') || 'new'
 
       if (target !== 'new') {
@@ -345,18 +356,30 @@ function handoffCommand(ctx, deps) {
         `（换届接任）你接手 **${key}**。先读 _registry\\handoff.json 与 PROJECT.md §当前状态，再按 §下一步 开工；交接参数由 /handoff 写入。`
       const created = await deps.defs.create.execute(
         {
+          // v0.8.5：**按层建会话**。以前这里把体系/项目键当域塞进 domain 参数、又不传 claim，
+          // 于是新会话收到的身份摘要是「你被指派到 X，要接任就 /register domain X」——
+          // 主会话换届被当成了域会话换届。layer 让工厂按层选账本、按层出文案。
+          layer,
           domain: key,
           task,
           agentPreset: preset,
-          permissionPreset: perm,
-          model,
+          ...(perm ? { permissionPreset: perm } : {}),
+          ...(model ? { model } : {}),
           title: `【${layer === 'system' ? '体系' : layer === 'project' ? '项目' : '域'}】${key} 接任`,
+          claim: true,
           allowExistingOwner: true,
         },
         { agent },
       )
       const lines = ['**交接回执**（来自 create_domain_session）', '```json', JSON.stringify(created, null, 2), '```']
-      lines.push('', '⚠️ 前任**还没退役**：先确认接班会话真的建对了，再执行 `/retire`。')
+      const ownerChanged = created && created.claim && created.claim.outcome && created.claim.outcome !== 'conflict'
+      lines.push(
+        '',
+        ownerChanged
+          ? `· 在任身份已转给新会话（${created.claim.outcome}）——**前任不会自动退役**：先确认接班会话真的建对了，再执行 \`/retire\`。`
+          : '· ⚠️ 在任身份**没有**转成（见回执 claim），先看回执再决定。',
+        '· 新窗口要你自己在左侧栏点开：宿主没有 Host→前台 的导航通道。',
+      )
       return reply(true, lines)
     },
   }
@@ -436,23 +459,32 @@ function resolveGate(deps, sessionId, cwd) {
 function pauseCommand(ctx, deps) {
   return {
     name: 'pause',
-    description: '按授权范围暂停协作活动（self 任何人；project 需项目主或体系主；global 需体系主）',
-    input: { hint: 'self|project|global [原因]' },
+    description: '按授权范围暂停协作活动（self/domain 任何人；project 需项目主或体系主；global 需体系主）',
+    input: { hint: 'self|domain <项目:域>|project|global [原因]' },
     async handler(invocation) {
       const agent = invocation && invocation.agent
       const sessionId = callerId(agent)
       if (!sessionId) return reply(false, ['拿不到调用者会话 id。'])
       const tokens = words(invocation.rawInput)
       const level = (tokens[0] || '').toLowerCase()
-      const reason = tokens.slice(1).join(' ')
-      if (!['self', 'project', 'global'].includes(level)) {
-        return reply(false, ['用法：`/pause self|project|global [原因]`', '· self＝只暂停自己（任何会话都能按）', '· project＝暂停整个项目（需项目主会话或体系主会话）', '· global＝暂停全局（需体系主会话）'])
+      // v0.8.5：加上 `domain <键>`——菜单里「按域暂停」一行要有个能真跑的命令接住它。
+      const domainKey = level === 'domain' ? (tokens[1] || '') : ''
+      const reason = (level === 'domain' ? tokens.slice(2) : tokens.slice(1)).join(' ')
+      if (!['self', 'domain', 'project', 'global'].includes(level)) {
+        return reply(false, ['用法：`/pause self|domain <项目:域>|project|global [原因]`', '· self＝只暂停自己（任何会话都能按）', '· domain＝暂停一个域（该域负责人、项目主或体系主可按下）', '· project＝暂停整个项目（需项目主会话或体系主会话）', '· global＝暂停全局（需体系主会话）'])
+      }
+      if (level === 'domain' && !domainKey) {
+        return reply(false, ['用法：`/pause domain <项目:域> [原因]`（例如 `/pause domain tixiweihu:docs`）', '菜单里有按域的现成选项，不用手打。'])
       }
       const cwd = callerCwd(ctx, agent)
       const gate = resolveGate(deps, sessionId, cwd)
-      const check = checkAuthority(gate, level, sessionId)
+      const check = checkAuthority(gate, level, sessionId, { deps, domainKey })
       if (!check.ok) return reply(false, check.lines)
-      const target = level === 'self' ? { scope: 'session', key: sessionId } : { scope: level, key: level === 'global' ? '*' : check.project }
+      const target = level === 'self'
+        ? { scope: 'session', key: sessionId }
+        : level === 'domain'
+          ? { scope: 'domain', key: check.key }
+          : { scope: level, key: level === 'global' ? '*' : check.project }
       if (!deps.defs || !deps.defs.pause) return reply(false, ['set_domain_state 不可用（插件未完整加载）。'])
       const result = await deps.defs.pause.execute(
         { domain: target.key, scope: target.scope, state: 'paused', note: reason || '人工暂停（/pause）', confirm: target.scope === 'global' ? true : undefined },
@@ -513,12 +545,40 @@ function pauseAllCommand(ctx, deps) {
   }
 }
 
-function checkAuthority(gate, level, sessionId) {
+function checkAuthority(gate, level, sessionId, extra = {}) {
   if (level === 'self') return { ok: true }
   if (gate.read.error) {
     return { ok: false, lines: [`注册册读不懂（${gate.read.error}）⇒ 判不出身份，按规则拒绝。`, '先修好 _registry\\domains.json 再暂停。'] }
   }
   const { identity, project } = gate
+  if (level === 'domain') {
+    // 域级暂停：**要求这个域真的存在**（域级暂停挂在声明册的一个 key 上，它不是"整台机器"或
+    // "某个项目"级别的开关）；按下的人要么是该域负责人，要么是项目主 / 体系主。
+    const key = String(extra.domainKey || '').trim()
+    if (!key) return { ok: false, lines: ['要暂停哪个域？写法：`/pause domain <项目:域>`。'] }
+    const loaded = loadDeclarations(extra.deps?.config?.domainsFile)
+    const entry = loaded?.byKey?.get(key.toLowerCase()) || null
+    if (!entry) {
+      return {
+        ok: false,
+        lines: [
+          `域名册里没有「${key}」这条在任声明 ⇒ 没有可暂停的域。`,
+          '· 先看现有域：`/register`（或问一句"列出在任声明"）',
+          '· 要暂停整个项目用 `/pause project`；只停自己用 `/pause self`',
+        ],
+      }
+    }
+    const isProjectMain = identity.projectMains.includes(entry.project) || identity.roles.some((role) => role.layer === 'project' && role.project === entry.project)
+    if (entry.sessionId === sessionId || identity.systemMain || isProjectMain) return { ok: true, key: entry.key, project: entry.project }
+    return {
+      ok: false,
+      lines: [
+        `你（${sessionId}）既不是「${entry.key}」的负责人，也不是它所在项目的主会话 ⇒ 拒绝暂停这个域。`,
+        `· 该域负责人：${entry.sessionId}`,
+        '· 出路：让负责人自己按；或由项目主/体系主按；只停自己用 `/pause self`。',
+      ],
+    }
+  }
   if (level === 'project') {
     const isProjectMain = identity.projectMains.includes(project) || identity.roles.some((role) => role.layer === 'project' && role.project === project)
     if (identity.systemMain || isProjectMain) return { ok: true, project }
