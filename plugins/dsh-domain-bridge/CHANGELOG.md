@@ -3,15 +3,85 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
-## [0.6.4] — 2026-10-18
+## [0.8.3] — 2026-10-20
 
-安全默认收窄，无其它行为变化。
+**真机 `/initialize` 一个文件都没建，还把整份清单报成「待人工」**，外加两条回执显示问题。根因只有一层：`runInitialize` 取 cwd 只认 `exec.agent.cwd`，而**宿主 Agent 对象不带 cwd**（cwd 只由 `workingDirectory` 服务给，命令层其实已经解析好了）⇒ 永远拿不到项目根 ⇒ 走 `no-project-root` 分支，把清单原样投影成「需人工：PROJECT.md、KNOWLEDGE.md…」并提示"拿不到项目根"。
 
-- **`domainSessionPreset` 的代码缺省值由 `danger-full-access` 改为 `workspace-write`**：`create_domain_session` 建完给新会话设的权限档，不再默认给「全盘写 + 免审批」。要全盘写权限必须**显式**配置（`cordis.patch.yml` 的 `domainSessionPreset`，或单次调用传 `permissionPreset`）——这等于把「我信任这台机器上的全部内容」写进配置。
-- 同步改动的文字：`cordis.patch.yml` 的注释与默认值、README 的配置示例、`create_domain_session` 的工具描述（两处）。
-- **未改**：任何工具的入参、回执形状、判定逻辑；未新增依赖；未动暂停/队列/唤醒接线。
+- **修**：cwd 来源改成 `args.projectRoot` > `args.cwd` > `exec.cwd` > `exec.agent.cwd`；`/initialize` 命令把已解析好的 cwd 显式当 `projectRoot` 传进去。现在**自动建** PROJECT.md / KNOWLEDGE.md / KNOWLEDGE\ / 提案\ / projectlog\ / .gitignore（模板能整份复制就复制，缺失退最小骨架）。
+- **修**：`待人工: [object Object]、[object Object]…`——回执条目是对象，命令层直接 `join` 就拼成了 `[object Object]`；改成只取 `path`。
+- **修**：正文重复一遍——`hint` 原来是 `lines.join('') + 下一步`，命令层又把 `hint` 显示一次；现在 `hint` 只放「只读 / 下一步 / 身份提示 / 体系层缺项」几句，正文段落另给 `notes` 字段。
+- **补护栏**：bootstrap 测试新增「真机形状」用例——`agent` 上**没有 cwd**、只给 `projectRoot` / `args.cwd` 时必须真建出文件（原先测试用 `agent.cwd` 模拟，正好绕过了这个 bug）。
 
-验证：`node test/smoke.mjs` 仍是 **282 用例 / 54,624 断言**全通过（本次只动缺省值与描述文字，测试里没有对缺省值的断言）。
+`smoke` 282 / `bootstrap` 16 用例 121 断言 / `commands` 31 / `menu` 19 全过。
+
+## [0.8.2] — 2026-10-19
+
+**顺序纠正：注册在前、初始化在后**（用户判断，采纳）。0.8.1 及以前把「目录里得有骨架标志文件」当成注册的**前置条件**：`/register system` 缺 `SYSTEM-OVERVIEW.md` 就拒绝，`/register project` 缺 `PROJECT.md` 就拒绝并让人先跑 `/initialize`。这个前置站不住——
+
+- 注册键就是 cwd 目录名（`projectOfCwd`），初始化的产出**不参与**推导，技术上是零依赖；
+- 标志文件自己就能造，它不是安全边界、只是仪式；
+- 全新目录（新建项目 / 新体系根）默认是空的，最自然的意图「我是这个项目的主会话」会被直接拒，正是弹窗要消灭的「记流程」；
+- 语义上「初始化」是执行、「注册」是声明：声明在先，后续每一笔骨架写入才能落在在任身份上（可归责）。
+
+改法（三处小改）：
+
+- `/register project`：去掉 `PROJECT.md` 预检，注册成功回执把 `/initialize` 指为下一步；保留「把 cwd 规整到项目根」（防子目录注册）。
+- `/register system`：缺 `SYSTEM-OVERVIEW.md` 时不再拒绝，改为**要一次显式确认**（`/register system --confirm`；菜单里是带二次确认的「注册为体系主会话（新体系根）」）——自封体系主仍是高权限动作，值得按一下，但不值得卡住流程。
+- `/initialize` 回执：「下一步 `/register project`」改为「若还没身份，先 `/register project`（注册不要求骨架先存在）」。
+
+`smoke` 282 / `menu` 18 / `commands` 28 全过。
+
+## [0.8.1] — 2026-10-19
+
+**真机 0.8.0 的两个症状是同一个根因**：`ctx.get('commands')` / `ctx.get('webServer')` 在**未注入**的服务上返回 undefined，于是 ① 六条宿主命令**从来没注册上**（用户输入 `/register` 没反应）② 菜单路由**没挂载**（点命令弹出菜单后报 `bridge menu 404`）。
+
+修法：两件事都放进**同一个** `ctx.inject(['commands','webServer'], child => …)` 子作用域（与 free-search 用 webServer 的姿势一致），服务查找改为「先取注入属性、再退 ctx.get」；注册结果写 warn 日志，下次一眼能看出有没有挂上。`smoke` 282 / `menu` 16 / `commands` 24 全过。
+
+## [0.8.0] — 2026-10-19
+
+**斜杠命令改成弹窗菜单**（与 `/free-search-engine` 同款：输入 `/` → 选中 → 弹菜单 → 点一下执行），并补三处真机问题。
+
+### 新增
+
+- `lib/client.js`（浏览器半边）：用 `commandUi.decorate` 给六条宿主命令挂 `popupSelect`。**为什么用 decorate 而不是 register**：同名贡献项会与宿主命令撞名报错；decorate 保留目录行与参数声明，只把「裸调用」换成一个弹窗。
+- `lib/core/menu.js`：三个宿主端点 `POST /api/dsh-domain-bridge/{health,menu,run}`。菜单**在宿主侧按真实状态算**（注册册 / 在任声明 / cwd），不在前端编；选项里的危险动作带 `confirmation`（接管域、退役、强停项目/全局、全盘写交接）。
+- 选择执行走 `ctx.commands.execute(agent, '/register system', …)` —— 复用宿主的命令执行器，所以回执会作为**命令流转节点**出现在会话里，草稿里不会留下脏 `/token`。
+- `/retire` 现在调 `markRetired`：**会话自己把标题加上（已退役）**（宿主已开启会话自改名）。
+- `package.json`：新增 `./client` 导出与 `dsh.client`（`platform: web`、`immediately`、注入 `@deepseek-ai/dsh-client-ui-commands`）。
+
+### 修复
+
+- `commands.js` / `menu.js` 读在任声明时用了不存在的字段（`declarations`），实际是 `entries` ⇒ `/register` 无参回执与 `/retire` 的域释放原先看不到自己持有的域，已修。
+
+### 验证
+
+`test/menu.test.mjs` 16 条；`test/commands.test.mjs` 24 条；`smoke` 282 用例 / 54,624 断言全过。**host 侧新增路由，需重启一次 dsh**；重启后 `GET/POST /api/dsh-domain-bridge/health` 可直接确认六条命令是否真注册。
+
+## [0.7.0] — 2026-10-19
+
+**六条宿主斜杠命令**（`/register` `/initialize` `/handoff` `/retire` `/pause` `/pause-all`）＋ 让它们能安全落账的**注册册**。命令是**编排器**：参数解析、身份校验、转调同一批工具定义（`claim` / `release` / `set_domain_state` / `create_domain_session`），**没有第二套治理实现**；命令由宿主执行，**不经过模型**。
+
+### 新增
+
+- `lib/core/registrations.js`：`domains.json` 新增**平行节** `registrations`（`owners` 一字不动，域负责人仍只在 `owners`），键规则 `"<项目>:system"` / `"<项目>:main"`；`identityOf` 三层身份；`projectOfCwd` 以 `SYSTEM-OVERVIEW.md` 判体系根（不硬编码 `D:\xiangmu`）。
+- `lib/core/commands.js`：六条命令 + **权限闸**（`self` 任何人；`project` 需项目主或体系主；`global` 需体系主；**判不出身份就拒绝**）＋ `/pause-all` 二次确认（`--confirm`）＋ 必填原因 ＋ `stateDir/audit.jsonl` 审计。命令重名只 warn 跳过，不覆盖别的插件。
+- `lib/core/bootstrap.js`：`/initialize [check]`，默认**只补不改**；复用 `init-project.ps1` 的清单与 `templates/` 下的模板文件（不调 PowerShell、不重写模板正文）；体系层只检查不创建。
+- 测试：`test/registrations.test.mjs`（13 用例 / 175 断言）、`test/bootstrap.test.mjs`（15 / 109）、`test/commands.test.mjs`（24）。
+
+### 修复（并发写）
+
+三个写盘器原来都用**固定名** `<file>.tmp` 且不加锁。实测两个子进程并发写 60 个键：改动前**只剩 2~12 个键（永久丢 48~58 个）**，改动后 **60/60 一个不少**。现在 `writeDeclarationsAtomic` 与注册册共用一把 `wx` 独占锁（`<file>.lock`，死锁按 PID 接管），tmp 名带 pid+随机后缀，rename 失败重试。
+
+### 验证
+
+`node test/smoke.mjs` **282 用例 / 54,624 断言全过**（3 处过期字面量同步到 0.7.0 / `workspace-write`，`blockedBook` 补占住新锁路径）；三个新测试文件全过；新/改文件 `node --check` 通过。
+
+### 已知限制
+
+- **需重启一次 dsh** 才生效（host 侧代码）。
+- v1 **没有客户端弹窗**：多级选择用文本参数（实测多级链式弹窗依赖未文档化字段，且会留下 `/reg` 脏文本被当提示词发给模型）。
+- `/handoff` 只能 `target=new`（交给现存会话需要对方自己 `/register`）；`/register system|project` 冲突时**不能强制接管**（域层可以 `takeover`）。
+- `D:\xiangmu\tools\domain-owner.mjs` 仍是固定名 tmp、不加锁 ⇒ CLI 的读-改-写仍可能覆盖插件的写入。
 
 ## [0.6.3] — 2026-10-18
 
@@ -299,7 +369,7 @@
 
 ### 背景
 
-- 重启后只有被"用到"的会话才有活 Agent（实测：重启前在线的 session-yyyyyyyy 重启后不在在线列表里、存档
+- 重启后只有被"用到"的会话才有活 Agent（实测：重启前在线的 session-c3e33193 重启后不在在线列表里、存档
   也不再被写；而旧 docs 会话在 13:41:31 被加载 ⇒「点一下才活」）。没加载的会话 = `agents.list()` 里没有
   = 投递拿不到 Agent = 报不可达（离线不排队）。而且 online 是**二元**的，分不清「还在、只是没开机」和
   「彻底没了」。核心早就有把会话拉活的 API：`ctx.sessionController.resume(sessionId)`

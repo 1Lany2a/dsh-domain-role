@@ -1,6 +1,6 @@
 # dsh-domain-bridge
 
-**域可达层 v0.6.4（安全默认：`domainSessionPreset` 缺省值由 `danger-full-access` 收窄为 `workspace-write`，要全盘写权限必须自己显式配置；无其它行为变化）**，模型分派见 `list_models` / `set_model` / `set_default_model`——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
+**域可达层 v0.8.3**（v0.7.0 起新增**六条斜杠命令**、v0.8 起带**弹窗菜单**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
 
 > v0.4.2 一句话：**任一级被按下就拦，拦的时候把「是哪几级按的」全部说出来；解一级不够——得把压着目标的那几级都解开，才会重投。**
 
@@ -9,8 +9,6 @@
 > v0.6.0 一句话：**`list_models` 只读目录，`set_model` 只改一个会话的模型；因为宿主改会话会顺手把选择写成全局默认，本插件一律「先记 → 改 → 恢复」，并把 `globalDefault:{before, after, restored}` 如实写进回执。**
 
 > v0.6.1 一句话：**首次真机验证暴露两个缺陷——`modelCatalog()` 是 async（v0.6.0 少了 `await`，目录恒空）与会话投影把"会话 id 字符串"喂给了只要 Session 对象的 `stateOf`（必抛）——本版都修了，并补上"统一改模型入口"的全局那一半 `set_default_model`（显式改全局默认、**永不恢复**）。**
-
-> ⚠️ **安全前提（用之前先读）**：本插件把「会话的管理权」交给模型——`force:true`（越过暂停/强制交接）、`set_default_model`（改全局默认模型）、`permissionPreset`（改新会话权限档）**只靠模型遵守工具描述，没有独立授权校验**。会话被内容注入诱导时，可能做出你没授权的跨会话操作。另外：项目级暂停**不中断已开跑的回合**；未读的 `inject` 队列在 dsh 重启时可能被整体取消（要保证送达用 `followup`）；`stateDir`/`domainsFile` 按可信输入处理，未做符号链接与穿越校验。完整威胁模型见仓库根的 [`SECURITY.md`](../../SECURITY.md)。
 
 ## 它解决什么
 
@@ -31,6 +29,25 @@
 | `list_models` | **（v0.6.0 新增，只读；v0.6.1 修目录来源与会话投影）列出宿主可路由的模型目录**：首选 `await ctx.sessionController.modelCatalog()`（**它是 async**），**`groups` 为空或形状不认识就退 `ctx.llm.listProviders()` / `listModels(provider)`**；`source` 如实写实际用了哪个（`sessionController.modelCatalog` / `llm` / `empty`）。两个来源都空 ⇒ 如实回 `{ok:true, source:"empty", groups:[], rawKeys:[…], note:"catalog-empty"}`（**不假装有内容**）。可选 `session`（会话 id / 域键）⇒ 额外读该会话的 `modelSelection` 投影，回执带 `session:{target,lastUsed,pending,source}`；读不到就**不给 `session`**、改报 `sessionRead:{ok:false,reason,tried,failures?}`。 |
 | `set_model` | **（v0.6.0 新增）改一个会话的模型，下一轮请求生效**。`target` 缺省＝调用者自己，可写会话 id 或域键；执行顺序固定：**记全局默认 → `selectModel` → 恢复全局默认**，回执 `{ok, sessionId, target, applied:"next-request", previous, globalDefault:{before, after, restored}}`。宿主失败码原样带回；恢复失败如实写 `restored:false` + error。 |
 | `set_default_model` | **（v0.6.1 新增）显式改宿主的全局默认模型，且永不恢复**（与 `set_model` 相反）。`{provider, model, reasoningEffort?}`；实现＝读 `before` → `ctx.agentDefaultModel.saveSelection(next)` → 读 `after`。影响面：**之后新建的、且尚无会话级选择的 Agent**；回执 `{ok, before, after, source:"agentDefaultModel", note, saved, verified, applied}`——宿主在没有部署配置入口/`configEditor` 时 `saveSelection` 是**静默 no-op**，所以读回来不一致就如实报 `verified:false` / `applied:"not-observed"`，绝不假装成功。服务不可用 ⇒ `api-unavailable`，参数非法 ⇒ `invalid-model`。 |
+
+## 斜杠命令（v0.7.0 起；v0.8.0 起带弹窗菜单）
+
+六条宿主命令，命令体**只做编排**（转调上面的工具定义，没有第二套实现、也不经过模型）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/register` | 把本会话注册为**体系主会话** / **项目主会话** / **域会话**（`domain <域> [takeover]` 转调 `claim_domain`）；不带参数＝只看当前身份与可选项 |
+| `/initialize [check]` | 生成 / 补全项目骨架：`PROJECT.md`、`KNOWLEDGE.md`、`KNOWLEDGE\`、`提案\`、`projectlog\`、`.gitignore` 标准条目——**只补缺失、绝不覆盖**；带 `check` 只报告、一个字节都不写 |
+| `/handoff` | 开一个接班会话并转移职责（默认参数表：体系 `cordis` / 项目 `standard` / 域 `standard`，模型 `wb/cn:deepseek-v4.1-flash`） |
+| `/retire` | 结束自己的任职：撤注册 + 释放域 + **session 级暂停** + 会话自我改名「（已退役）」；不删历史 |
+| `/pause` | 暂停自己 / 本项目 / 全局（按身份闸；判不出身份就拒绝） |
+| `/pause-all` | 紧急通道：强制暂停（必填原因 + `--confirm`，写 `stateDir/audit.jsonl`） |
+
+**顺序约定：注册在前、初始化在后。** 注册键就是 cwd 目录名，初始化的产出**不参与**推导——所以空目录（新建项目 / 新体系根）也能先注册，`/initialize` 随后把骨架建起来。只有 `/register system` 在目录里没有 `SYSTEM-OVERVIEW.md` 时要一次显式确认（`--confirm`）：自封体系主会拿到 `/pause global` 权限，值得按一下。
+
+**弹窗菜单**：浏览器半边（`lib/client.js`）用 `commandUi.decorate` 给这六条命令挂 `popupSelect`——输入 `/`、选中命令就能点选参数，不用背语法。菜单**在宿主侧按真实状态算**（`POST /api/dsh-domain-bridge/{health,menu,run}`，仅本机可访问），危险动作（接管域、退役、强停、全盘写交接）带二次确认；选完走 `ctx.commands.execute`，回执作为命令流转节点留在会话里。
+
+**注册册**：写在 `_registry/domains.json` 的平行节 `registrations`（`owners` 一字不动，域声明仍在 `owners`）。写盘全程持 `wx` 独占锁 + 唯一临时文件——固定名 `.tmp` 且无锁时，两进程并发各写 30 键最终只剩 2~12 个（静默丢写）。
 
 ## 两个轴 + 生命周期：v0.4 的状态模型
 
@@ -367,7 +384,7 @@ config:
 ```yaml
 config:
   stateDir: '<你的目录>'                            # v0.4.0：政策轴「已暂停」+ 落盘队列；不给＝<home>/state，写 '' 也退回默认
-  domainSessionPreset: 'workspace-write'           # v0.3.3：create_domain_session 建完设的权限档；v0.6.4 起缺省＝workspace-write，要全权自己写 danger-full-access
+  domainSessionPreset: 'danger-full-access'        # v0.3.3：create_domain_session 建完设的权限档
 ```
 
 `indexFile` / `domainsFile` / `stateDir` **读不到或格式坏掉一律静默降级**（当成"没有域标注 / 没有人认领 / 没有暂停"），不抛错、不影响投递；`domainSessionPreset` 写 `''` / `none` 即关掉那一步（保持宿主默认档）。`<home>` 全空（没有 config、两个默认文件也不存在）时插件照常加载，只是报「0 个域」。

@@ -1,12 +1,15 @@
 {
   "name": "dsh-domain-bridge",
-  "version": "0.6.4",
-  "description": "域可达层：声明优先的域寻址、会话工厂、四级「已暂停」、唤醒接线与模型分派。工具清单与口径见 README.md，变更史见 CHANGELOG.md。",
+  "version": "0.8.3",
+  "description": "域可达层：声明优先的域寻址、会话工厂、四级「已暂停」、唤醒接线、模型分派与斜杠命令（带弹窗菜单）。工具清单与口径见 README.md，变更史见 CHANGELOG.md。",
   "type": "module",
   "main": "lib/bridge.js",
   "exports": {
     ".": {
       "default": "./lib/bridge.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
   },
@@ -18,7 +21,8 @@
     "domain",
     "session",
     "orchestration",
-    "pause"
+    "pause",
+    "command"
   ],
   "license": "MIT",
   "engines": {
@@ -32,6 +36,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-commands"
+      ]
     }
   },
   "scripts": {

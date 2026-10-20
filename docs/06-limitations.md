@@ -6,23 +6,23 @@
 
 ## A. 未实现（有规格、没有一行代码）
 
-### A1 `bootstrap_project` 未实现
+### A1 `bootstrap_project` 已实现为 `initialize_project` / `/initialize`
 
-- **现状**：只有规格（参数表、三档口径、执行阶梯与回执形状都已写死）——**代码一行未写**。前置条件卡在：`create_domain_session` 的编排没有抽成可复用函数，全写在 `execute` 闭包里（约 547 行）；bootstrap 想复用「建会话＋权限＋标题＋置顶＋排任务」这条阶梯，只能 ① 先抽成导出函数（要重跑 smoke）或 ② 复制一份（两处口径会漂）。
-- **影响**：「为一个项目建骨架」目前**只能手工或脚本**做；仓库 README 的「快速开始」是设计目标，不是现状。且它建会话前必须过四级 OR 暂停闸，否则就成了「已暂停」的后门。
-- **出处**：`{体系根}/_pages/插件自动化与GUI准备-2026-10-18.data.js` §三（工具规格）、§八（硬约束）、§九（还没做的）；`README.md`「快速开始」节。
+- **现状**：0.7.0 起 `lib/core/bootstrap.js` 落地——`/initialize [check]` 按契约 §4 的清单**只补缺失**（`PROJECT.md`、`KNOWLEDGE.md`、`KNOWLEDGE\`、`提案\`、`projectlog\`、`.gitignore` 标准条目；模板能整份复制就复制，缺失退最小骨架），`check` 档只报告、一个字节都不写。0.8.3 修掉了「只认 `exec.agent.cwd`、真机拿不到项目根 ⇒ 整份清单退化成需人工」的 bug（宿主 Agent 对象不带 cwd，cwd 只由 `workingDirectory` 服务给）。
+- **仍未实现的部分**：它**只建文件骨架**，不建「项目主会话」那条会话（建会话仍走 `create_domain_session` / `/handoff`）；体系层（`SYSTEM-OVERVIEW.md` / `templates\` / `_registry\` / `tools\`）**只检查、不创建**，这是刻意口径。
+- **出处**：`plugins/dsh-domain-bridge/lib/core/bootstrap.js`、`CHANGELOG.md` 0.8.3、`test/bootstrap.test.mjs`（16 用例 / 121 断言）。
 
 ### A2 GUI 侧栏页未实现
 
-- **现状**：挂载点已**实测**（宿主已有 `sidebar.panellist` 侧栏入口行 + `main` 整页容器两个 root 作用域 slot；第三方唯一先例整个客户端文件只有 21 行）；但 `lib/client.js` **一行未写**。宿主半边的空壳 + 一个最小只读页属下一轮。
-- **影响**：现在**没有界面**——所有操作都要"在会话里说一句、AI 调工具"；只读数据面（读 `_registry/*.json` 与域名册）也还没有页面承载。
-- **出处**：`{体系根}/_pages/插件自动化与GUI准备-2026-10-18.data.js` §七（挂载点与只读数据面）、§九。
+- **现状**：`lib/client.js` 已有，但它只做**命令弹窗**（`commandUi.decorate` + `popupSelect`，数据来自 `POST /api/dsh-domain-bridge/{health,menu,run}`）；**侧栏整页 / 在任看板**仍没有页面。
+- **影响**：域与在任状态目前只能「在会话里问一句」或直接看 `_registry/*.json`；没有只读面板可点。
+- **出处**：`lib/client.js`、`lib/core/menu.js`、`CHANGELOG.md` 0.8.0。
 
-### A3 退役机制不存在（`retire_session` 未实现）
+### A3 退役：有 `/retire` 动作，没有独立工具
 
-- **现状**：**「退役」在会话级没有对应档位**——`markRetired` 只挂域动作，主会话够不着；插件里也**没有 `retire_session` 这个工具**。当前做法是「真值登记 ＋ 自己用 `set_domain_state(scope=session)` 把自己暂停」**近似**，并把「标题标记做不到」如实记进源记录的用例里。
-- **影响**：退役**不是**一个可调的原子动作，而是一套人工约定；没有"标题标记"、没有一次性收尾。想真做需要新增工具（会打断现有工具集断言，见 D2）。
-- **出处**：`{体系根}/_registry/DOMAIN-JUDGMENTS.md` 判断记录（体系主会话换届退役那行：`markRetired` 只挂域动作、以「登记 ＋ 会话级暂停」近似）。
+- **现状**：0.7.0 起 `/retire` 是原子动作——撤注册 + 释放自己持有的域 + **session 级暂停** + 会话自我改名「（已退役）」；但它是**命令**而不是工具（`retire_session` 仍不存在），别的会话替你调不了。
+- **影响**：退役只能由当事会话自己执行；窗口已离线时只能人工点开。
+- **出处**：`lib/core/commands.js`（`/retire`）、`CHANGELOG.md` 0.7.0。
 
 ## B. 判定不完美（会漏拦、会复活）
 

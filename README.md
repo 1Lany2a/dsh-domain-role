@@ -7,7 +7,7 @@
 
 > **English summary**: A cross-session governance framework for DeepSeek Harness (dsh). Instead of treating chat windows as disposable workers, it gives every area of responsibility a durable *domain* identity, an explicit *duty declaration* ("who owns this domain right now"), a mailbox with pause/queue semantics, and role task books that let a new session start working in one message. It is deliberately **not** another agent-team runtime: the unit of identity is the domain, not the session.
 
-> ⚠️ **状态：实验性 / 半成品（v0.1.0）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
+> ⚠️ **状态：实验性 / 半成品（插件 v0.8.3）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
 
 ---
 
@@ -65,7 +65,7 @@ AI 编程的日常里，有三件事反复伤人：
 | **派发口径** | 三级会话怎么分工、任务怎么派、编号怎么编、达成报告五段字段 | `templates/dispatch-template.md` |
 | **索引** | 从会话存档、使命库与域名册生成「谁在动哪个文件、有没有冲突」 | `tools/session-registry.mjs` |
 | **交接包** | 给接手方生成开局材料（默认 JSON，要人读时现渲一页 MD） | `tools/session-registry.mjs --handoff` |
-| **域桥插件** | dsh 宿主插件，11 个工具：投递／建会话／认领／释放／暂停／撤回／列在任／列会话／列模型／改模型／改默认模型 | `plugins/dsh-domain-bridge/` |
+| **域桥插件** | dsh 宿主插件，11 个工具：投递／建会话／认领／释放／暂停／撤回／列在任／列会话／列模型／改模型／改默认模型；外加**六条斜杠命令**（`/register` `/initialize` `/handoff` `/retire` `/pause` `/pause-all`，v0.8 起带**弹窗菜单**，不用背参数） | `plugins/dsh-domain-bridge/` |
 | **文档渲染器** | 结构化数据 → 单文件 HTML（数据是唯一可编辑处，页面是产物） | `tools/render-doc.mjs` |
 
 ## ⚠️ 安全与风险（用之前先读）
@@ -89,7 +89,7 @@ AI 编程的日常里，有三件事反复伤人：
 ```text
 # 1. 装宿主插件（dsh 需要重启才会加载）
 #    把 plugins/dsh-domain-bridge 挂进 profile 的 dependencies（link:）与 bundles
-# 2. 为一个项目建骨架（当前：手工 / 脚本；自动化的 bootstrap_project 仍在实现中）
+# 2. 为一个项目建骨架：在该项目的会话里跑 /initialize（只补缺失、绝不覆盖；先 /register 注册身份也可以）
 # 3. 开局读两样东西
 node tools/session-registry.mjs --handoff        # 交接包（机器读 JSON）
 node tools/session-registry.mjs --handoff-md     # 需要人读时现渲一页

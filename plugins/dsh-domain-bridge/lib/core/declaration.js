@@ -10,6 +10,8 @@ import path from 'node:path'
 import { PLUGIN, VERSION, TRACE_ID, TRACE_ID_V040, SCOPE_DOMAIN, STATE_TERMINATED, loadIndex, emptyIndex, shortId, describe, liveTopLevel, dutyMap, isSessionOnline, ownerCliRef, messageOf } from './shared.js'
 import { warn, tool } from './tools.js'
 import { INBOX_DELIVERED, loadInbox, loadInboxes, domainEnvelope, domainMessage, deliverToAgent } from './messaging.js'
+// v0.7（spec §2.3 最后一条）：写入复用注册册那一把进程间锁 + 唯一名 tmp —— 同一份实现，别抄第二份。
+import { withDomainsLock, writeAtomicUnique } from './registrations.js'
 import { loadDomainStates, writeDomainStateAtomic, domainSnapshot, pausedScopesOf, pausedByScopesOf, pausedScopesWords, pausedWhoWords, domainStateSection, sessionPauseFields, pauseCandidatesForDomain, pauseCandidatesGlobal, pauseHitsOfDisk, pausedNoticeOf } from './pause.js'
 import { clipToBytes, liveAgentOf, markRetired } from './session-factory.js'
 
@@ -110,27 +112,24 @@ export function readDeclarationsForWrite(file) {
 }
 
 /**
- * Read-modify-write with atomic replace, exactly like the CLI: write "<file>.tmp" first, then
- * rename over the original. The original file is never deleted first, and a failed write
+ * Read-modify-write with atomic replace, exactly like the CLI: write the body to a UNIQUE temp name
+ * first, then rename over the original. The original file is never deleted first, and a failed write
  * cleans up its own temp file without masking the original error.
+ *
+ * v0.7（spec §2.3 最后一条，只改两点，其它逻辑一字不动）：
+ *   ① 整段写盘挪进 `withDomainsLock()` —— 与注册册（registrations.js）用**同一把**进程间锁
+ *      （`.lock` 文件），跨进程的读-改-写不再互相踩；
+ *   ② tmp 换成**唯一名**（`<file>.<pid>.<rand>.tmp`）—— 固定名 `<file>.tmp` 在并发下会静默丢写
+ *      （实测：A 报成功、内容却被 B 冲掉），而且外部 CLI（domain-owner.mjs）仍用固定名 tmp，
+ *      唯一名才不会跟它撞车。
+ * 对外行为保持不变：成功回 `{bytes}`，失败**抛错**（调用方原有的 try/catch 一行都不用改）。
  */
 export function writeDeclarationsAtomic(file, data) {
   data.updatedAt = new Date().toISOString()
   const body = JSON.stringify(data, null, 2) + '\n'
-  const tmp = file + '.tmp'
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  try {
-    fs.writeFileSync(tmp, body, 'utf8')
-    fs.renameSync(tmp, file)
-  } catch (error) {
-    try {
-      fs.unlinkSync(tmp)
-    } catch {
-      /* 清理失败不掩盖原始错误 */
-    }
-    throw error
-  }
-  return { bytes: Buffer.byteLength(body, 'utf8') }
+  const locked = withDomainsLock(file, () => writeAtomicUnique(file, body))
+  if (!locked.ok) throw new Error(locked.error || 'declaration-write-failed')
+  return { bytes: locked.value.bytes }
 }
 
 // ------------------------------- portable runtime home (home / config.json / env / defaults)

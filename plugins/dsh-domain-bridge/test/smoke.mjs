@@ -360,6 +360,7 @@ function bookFile(name, owners, raw) {
 function blockedBook(name) {
   const dir = path.join(root, `blocked-${++bookSeq}-${name}`)
   fs.mkdirSync(path.join(dir, 'domains.json.tmp'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'domains.json.lock'), { recursive: true })
   return path.join(dir, 'domains.json')
 }
 
@@ -395,7 +396,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.6.4', `package.json 版本不是 0.6.4（实际 ${pkg.version}）`)
+eq(pkg.version, '0.8.3', `package.json 版本不是 0.7.0（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -1378,10 +1379,10 @@ const TITLE_RE = /^\[docs\] \d{4}-\d{2}-\d{2} \d{2}:\d{2} · /
     createExec,
     'v033/title-and-preset',
   )
-  eq(presets.calls.resolve, ['workspace-write'], '默认应 resolve 配置里的档名（v0.6.4 起缺省＝workspace-write）')
+  eq(presets.calls.resolve, ['workspace-write'], '默认应 resolve 配置里的档名（v0.6.4 起缺省 workspace-write）')
   eq(presets.calls.set.length, 1, 'set 应被调用一次')
   eq(presets.calls.set[0].session, created.session, 'set 必须拿到 Session 对象（不是 id）')
-  eq(presets.calls.set[0].name, 'workspace-write', 'set 的档名不对')
+  eq(presets.calls.set[0].name, 'workspace-write', 'set 的档名不对（v0.6.4 起缺省 workspace-write）')
   eq(out.permission, { requested: true, preset: 'workspace-write', ok: true }, 'permission 回执不对')
   eq(titles.calls.rename.length, 1, 'rename 应被调用一次')
   eq(titles.calls.rename[0].session, created.session, 'rename 必须拿到 Session 对象（不是 id）')

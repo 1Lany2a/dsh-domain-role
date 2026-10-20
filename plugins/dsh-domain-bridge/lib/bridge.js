@@ -1,6 +1,15 @@
 /**
- * dsh-domain-bridge — domain reachability layer v0.6.4
- *   (declaration-first + session factory + four-level pause + wake wiring + model dispatch)
+ * dsh-domain-bridge — domain reachability layer v0.8.0
+ *   (declaration-first + session factory + four-level pause + wake wiring + model dispatch
+ *    + slash commands)
+ *
+ * Commands (6, Host-side; a command is a thin orchestrator over the tools below):
+ *   /register [system|project [名称]|domain <域> [takeover]]   register this session's role
+ *   /initialize [check]                                        complete the run skeleton (never overwrite)
+ *   /handoff [model=…][preset=…][perm=…][target=new]           create a successor and transfer duty
+ *   /retire [原因]                                              end this session's duty (keeps history)
+ *   /pause self|project|global [原因]                           pause by authority
+ *   /pause-all <self|project|global> <原因> [--confirm]         emergency pause (confirm + audit)
  *
  * Tools (11):
  *   list_domain_sessions()                         online top-level sessions + onDuty flags + every declaration
@@ -24,6 +33,9 @@ import { buildSendTool } from './core/messaging.js'
 import { buildSetDomainStateTool, buildWithdrawMessageTool } from './core/pause.js'
 import { buildListTool, buildClaimTool, buildReleaseTool, buildListOwnersTool } from './core/declaration.js'
 import { buildListModelsTool, buildSetModelTool, buildSetDefaultModelTool, buildCreateSessionTool } from './core/session-factory.js'
+import { runInitialize } from './core/bootstrap.js'
+import { buildCommandDefs, registerCommandDefinitions } from './core/commands.js'
+import { registerMenuRoutes } from './core/menu.js'
 
 export * from './core/shared.js'
 export * from './core/tools.js'
@@ -31,6 +43,10 @@ export * from './core/messaging.js'
 export * from './core/pause.js'
 export * from './core/declaration.js'
 export * from './core/session-factory.js'
+export * from './core/registrations.js'
+export * from './core/bootstrap.js'
+export * from './core/commands.js'
+export * from './core/menu.js'
 
 export default {
   name: 'domain-bridge',
@@ -69,21 +85,46 @@ export default {
         stateDir: rawConfig && rawConfig.stateDir !== undefined ? rawConfig.stateDir : '',
       }
 
-      registerTool(ctx, buildListTool(ctx, config))
-      registerTool(ctx, buildSendTool(ctx, config))
-      registerTool(ctx, buildClaimTool(ctx, config))
-      registerTool(ctx, buildReleaseTool(ctx, config))
-      registerTool(ctx, buildListOwnersTool(ctx, config))
-      registerTool(ctx, buildCreateSessionTool(ctx, config))
-      // v0.4.0：「已暂停」的人工控制入口 + 队列撤回入口。
-      registerTool(ctx, buildSetDomainStateTool(ctx, config))
-      registerTool(ctx, buildWithdrawMessageTool(ctx, config))
-      // v0.6.0：模型分派（只读目录 + 单会话模型选择）。宿主没有对应 API 时工具照常注册、如实回
-      // api-unavailable / source:'empty' —— 注册本身永不抛。v0.6.1 补 set_default_model（全局那一半）。
-      registerTool(ctx, buildListModelsTool(ctx, config))
-      registerTool(ctx, buildSetModelTool(ctx, config))
-      // v0.6.1：全局默认模型的**唯一**写入入口（显式改、不恢复）。改会话级选择用 set_model。
-      registerTool(ctx, buildSetDefaultModelTool(ctx))
+      // v0.7.0: build each definition ONCE, register it, and hand the SAME object to the command
+      // layer — so /register, /handoff, /retire, /pause call the exact governance code the model
+      // calls. A command is an orchestrator, never a second implementation.
+      const defs = {
+        list: buildListTool(ctx, config),
+        send: buildSendTool(ctx, config),
+        claim: buildClaimTool(ctx, config),
+        release: buildReleaseTool(ctx, config),
+        owners: buildListOwnersTool(ctx, config),
+        create: buildCreateSessionTool(ctx, config),
+        pause: buildSetDomainStateTool(ctx, config),
+        withdraw: buildWithdrawMessageTool(ctx, config),
+        listModels: buildListModelsTool(ctx, config),
+        setModel: buildSetModelTool(ctx, config),
+        setDefaultModel: buildSetDefaultModelTool(ctx),
+      }
+      // v0.4.0：「已暂停」的人工控制入口 + 队列撤回入口；v0.6.0 模型分派；v0.6.1 全局默认模型入口。
+      // 宿主没有对应 API 时工具照常注册、如实回 api-unavailable —— 注册本身永不抛。
+      for (const definition of Object.values(defs)) registerTool(ctx, definition)
+      // v0.7.0：六条宿主斜杠命令（/register /initialize /handoff /retire /pause /pause-all）。
+      // v0.8.0：同一批定义既注册成命令，也挂到 popup 菜单路由上——一个实现，两个入口。
+      // ⚠️ 0.8.1 修复：`ctx.get('commands')` / `ctx.get('webServer')` 在**未注入**时拿不到服务，
+      // 于是命令没注册上（输入 /register 无反应）、菜单路由没挂上（弹出菜单后 404）。
+      // 正确姿势是 `ctx.inject([...], child => ...)`，与 free-search 的 webServer 用法一致。
+      const commandDefs = buildCommandDefs(ctx, { config, defs, runInitialize })
+      // 两个服务必须注入在**同一个子作用域**里：菜单路由的执行阶段还要用 commands（执行命令）
+      // 与 agents（拿调用者），跨作用域取不到。
+      ctx.inject(['commands', 'webServer'], (bridgeCtx) => {
+        try {
+          registerCommandDefinitions(bridgeCtx, commandDefs)
+        } catch (error) {
+          warn(`command registration failed: ${error?.message || String(error)}`)
+        }
+        try {
+          registerMenuRoutes(bridgeCtx, { config, defs, runInitialize, commandDefs })
+          warn('command menu routes registered (/api/dsh-domain-bridge/{health,menu,run})')
+        } catch (error) {
+          warn(`menu routes failed: ${error?.message || String(error)}`)
+        }
+      })
       warn(
         `loaded v${VERSION} (tools: list_domain_sessions, send_to_domain, claim_domain, release_domain, ` +
           `list_domain_owners, create_domain_session, set_domain_state, withdraw_domain_message, ` +
