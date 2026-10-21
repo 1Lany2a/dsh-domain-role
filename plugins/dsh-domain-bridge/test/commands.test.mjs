@@ -59,6 +59,7 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   const out = await run('register', 'system')
   caseOk(out.kind === 'error' && out.text.includes('SYSTEM-OVERVIEW'), '缺体系口径源时应先要确认')
   caseOk(out.text.includes('--confirm'), '提示里要给出 --confirm 用法')
+  caseOk(!out.text.includes('会补上 SYSTEM-OVERVIEW'), '不会再声称 /initialize 会补体系口径源（它只建项目骨架）')
 }
 
 // 5. 注册先行：项目根没有 PROJECT.md 也能注册（项目名特意不匹配 cwd，避免影响后面的权限断言）

@@ -88,11 +88,14 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
 
     // 顺序约定：注册在前、初始化在后。目录里没有 SYSTEM-OVERVIEW.md 时不再拒绝，
     // 改成走一次确认（id 带 --confirm），用于"新体系根还没建骨架"的引导期。
+    // v0.8.6 修：**别人在任、这一行是"接手"时，id 必须带 `takeover`**。
+    // 以前 92/120 两行即使弹了"确认接任"，执行的仍是 `/register system`（force=false）⇒ 必撞冲突。
+    const systemTakeover = Boolean(systemOwner && systemOwner !== sessionId)
     const systemOption = isSystemRoot
-      ? option('system', systemOwner === sessionId ? '我已是体系主会话' : systemOwner ? `成为体系主（接手 ${shortId(systemOwner)}）` : '成为体系主会话', systemOwner ? `${shortId(systemOwner)} 在任` : '当前无主', {
+      ? option(systemTakeover ? 'system takeover' : 'system', systemOwner === sessionId ? '我已是体系主会话' : systemOwner ? `成为体系主（接手 ${shortId(systemOwner)}）` : '成为体系主会话', systemOwner ? `${shortId(systemOwner)} 在任` : '当前无主', {
         group: group('system', '体系层'),
         active: systemOwner === sessionId,
-        ...(systemOwner && systemOwner !== sessionId
+        ...(systemTakeover
           ? {
               confirmation: {
                 title: `确认由你接任 ${systemKey}？`,
@@ -104,7 +107,7 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
             }
           : {}),
       })
-      : option('system --confirm', '成为体系主会话（新体系根）', systemOwner ? `${shortId(systemOwner)} 在任` : '目录缺 SYSTEM-OVERVIEW.md，确认后注册，`/initialize` 会补', {
+      : option(systemTakeover ? 'system takeover' : 'system --confirm', '成为体系主会话（新体系根）', systemOwner ? `${shortId(systemOwner)} 在任` : '目录缺 SYSTEM-OVERVIEW.md；确认后注册（该文件不会被 /initialize 自动创建）', {
         group: group('system', '体系层'),
         active: systemOwner === sessionId,
         confirmation: {
@@ -117,7 +120,7 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
       })
     options.push(systemOption)
     options.push(
-      option('project', projectOwner === sessionId ? '我已是项目主会话' : projectOwner ? `成为项目主（接手 ${shortId(projectOwner)}）` : '成为项目主会话', `${projectName || '推不出项目'}${projectOwner ? `：${shortId(projectOwner)} 在任` : '：当前无主'}`, {
+      option(projectOwner && projectOwner !== sessionId ? 'project takeover' : 'project', projectOwner === sessionId ? '我已是项目主会话' : projectOwner ? `成为项目主（接手 ${shortId(projectOwner)}）` : '成为项目主会话', `${projectName || '推不出项目'}${projectOwner ? `：${shortId(projectOwner)} 在任` : '：当前无主'}`, {
         group: group('project', '项目层'),
         active: projectOwner === sessionId,
         ...(projectOwner && projectOwner !== sessionId
@@ -301,11 +304,27 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
     } catch {
       entries = []
     }
+    const others = entries.filter((row) => row.scope === 'session' && String(row.key) !== sessionId)
+    const actionable = entries.length - others.length
     const options = [
-      option('', '看当前暂停记录（只读）', entries.length ? `${entries.length} 条被按下` : '当前没有暂停记录', {
-        group: group('list', '状态 · 只读'),
-      }),
+      option(
+        '',
+        '看当前暂停记录（只读）',
+        entries.length
+          ? `${entries.length} 条被按下${others.length ? `：其中 ${actionable} 条可用菜单恢复，${others.length} 条是别人的单会话` : ''}`
+          : '当前没有暂停记录',
+        { group: group('list', '状态 · 只读') },
+      ),
     ]
+    // v0.8.6：**别人的单会话暂停，本命令恢复不了**（`/resume` 的 session 级只指"你自己"）。
+    // 以前这些记录被静默跳过，菜单只显示"6 条被按下"却一行可点都没有——现在明说这条边界。
+    if (others.length) {
+      options.push(
+        option('', `看那 ${others.length} 条明细（恢复要人手动 / 用工具）`, '别人的单会话暂停：用 set_domain_state(scope="session", domain="<完整会话id>", state="active")', {
+          group: group('list', '状态 · 只读'),
+        }),
+      )
+    }
     let ownPaused = false
     for (const row of entries) {
       // 兼容旧记录：v0.8.5 之前 /retire 把原因写成 `pauseNote`（输出名，读不回来）；

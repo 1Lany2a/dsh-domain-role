@@ -11,7 +11,7 @@ import { PLUGIN, VERSION, TRACE_ID, TRACE_ID_V040, SCOPE_DOMAIN, STATE_TERMINATE
 import { warn, tool } from './tools.js'
 import { INBOX_DELIVERED, loadInbox, loadInboxes, domainEnvelope, domainMessage, deliverToAgent } from './messaging.js'
 // v0.7（spec §2.3 最后一条）：写入复用注册册那一把进程间锁 + 唯一名 tmp —— 同一份实现，别抄第二份。
-import { withDomainsLock, writeAtomicUnique } from './registrations.js'
+import { withDomainsLock, writeAtomicUnique, readRegistrations, listRegistrations } from './registrations.js'
 import { loadDomainStates, writeDomainStateAtomic, domainSnapshot, pausedScopesOf, pausedByScopesOf, pausedScopesWords, pausedWhoWords, domainStateSection, sessionPauseFields, pauseCandidatesForDomain, pauseCandidatesGlobal, pauseHitsOfDisk, pausedNoticeOf } from './pause.js'
 import { clipToBytes, liveAgentOf, markRetired } from './session-factory.js'
 
@@ -586,6 +586,31 @@ export function buildListTool(ctx, config) {
       const index = loadIndex(config.indexFile)
       const declarations = loadDeclarations(config.domainsFile)
       const duties = dutyMap(declarations)
+      // v0.8.6：主会话层（体系主 / 项目主）登记在**注册册**里，不在 owners 里。只按 owners 算 duties，
+      // 会让已登记的体系主在 list_* 里显示 `onDuty:false`（2026-10-21 实测：本会话迁移到
+      // registrations 后就是这样）——身份没丢，是这张表漏了一本账。这里把注册册的角色并进同一张表，
+      // 行形状与 owners 一致（多带 layer，读的人能分清是域还是主会话）。
+      try {
+        const regRead = readRegistrations(config.domainsFile)
+        for (const row of listRegistrations(regRead && regRead.doc)) {
+          const sid = row.sessionId
+          if (!sid) continue
+          const list = duties.get(sid) || []
+          const lower = String(row.key ?? '').toLowerCase()
+          if (lower && list.some((item) => String(item.key ?? '').toLowerCase() === lower)) continue
+          list.push({
+            key: row.key,
+            project: row.project ?? null,
+            domain: row.domain ?? null,
+            sessionId: sid,
+            since: row.since ?? null,
+            layer: row.layer ?? null,
+          })
+          duties.set(sid, list)
+        }
+      } catch {
+        /* 注册册读不到就只按 owners 算，绝不因此让 list 失败 */
+      }
       const rows = liveTopLevel(ctx, index, duties)
       const states = loadDomainStates(config.stateDir)
       const inboxes = loadInboxes(config.stateDir)

@@ -396,7 +396,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.8.5', `package.json 版本不对（实际 ${pkg.version}）`)
+eq(pkg.version, '0.8.6', `package.json 版本不对（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -5010,7 +5010,7 @@ const SET_DEFAULT_NOTE = '影响之后新建的、且尚无会话级选择的 Ag
   eq(fixture.calls.filter((item) => item.kind === 'saveSelection').length, 1, '写入仍应发生')
 }
 
-// ── v0.8.5（主会话换届）：layer=system 必须写**注册册**、按层出身份摘要与信封标签，
+// ── v0.8.6（主会话换届）：layer=system 必须写**注册册**、按层出身份摘要与信封标签，
 // 且不再把新会话引去 /register domain —— 这就是「主会话换届被当成域会话换届」的根因回归。
 {
   const book = bookFile('v085-system-layer', {})
@@ -5033,6 +5033,37 @@ const SET_DEFAULT_NOTE = '影响之后新建的、且尚无会话级选择的 Ag
   eq(doc.registrations['tixiweihu:system'].sessionId, 'session-sys0001', '体系层必须写 registrations')
   ok(!(doc.owners || {})['tixiweihu:system'], '体系层不该写 owners（那是域的账本）')
   ok(String(out.titled.title || '').startsWith('【体系】'), '默认标题应带【体系】前缀')
+}
+
+// ── v0.8.6：主会话登记在**注册册**里，list_* 的 onDuty 必须认它（否则体系主会显示"不在任"）
+{
+  const book = bookFile('v086-reg-on-duty', {})
+  const doc = JSON.parse(fs.readFileSync(book, 'utf8'))
+  doc.registrations = {
+    'tixiweihu:system': {
+      key: 'tixiweihu:system',
+      layer: 'system',
+      project: 'tixiweihu',
+      domain: 'system',
+      sessionId: 'session-reg0001',
+      since: '2026-10-21T00:00:00.000Z',
+      by: null,
+      title: '',
+      note: '',
+    },
+  }
+  fs.writeFileSync(book, JSON.stringify(doc, null, 2) + '\n', 'utf8')
+  const agent = makeAgent('session-reg0001')
+  const out = await call(
+    mount({ agents: [agent], domainsFile: book }),
+    'list_domain_sessions',
+    {},
+    { agent },
+    'list_domain_sessions/registration-on-duty',
+  )
+  eq(out.self.onDuty, true, '主会话登记在注册册里时，self.onDuty 必须为 true')
+  ok(out.self.dutyDomainKeys.includes('tixiweihu:system'), 'dutyDomainKeys 应包含注册册里的键')
+  eq(out.onlineTopLevelCount, 1, '在线会话计数不应受影响')
 }
 
 console.warn = realWarn

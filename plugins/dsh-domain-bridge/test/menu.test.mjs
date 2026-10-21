@@ -130,4 +130,16 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(row.confirmation && row.confirmation.confirmLabel, '一步到位必须带确认')
   ok(out.options.some((o) => o.group.name === 'then'), '它应落在「建完之后」分组里')
 }
+// 10. v0.8.6：别人在任时，"接手"那一行必须真的带 takeover（以前弹了确认却执行 /register → 必撞冲突）
+{
+  upsertRegistration(domainsFile, { key: 'tixiweihu:system', layer: 'system', project: 'tixiweihu', domain: 'system', sessionId: 'session-other0001', since: new Date().toISOString(), by: 'session-other0001', title: '', note: '' }, { force: true })
+  const out = buildMenuOptions(ctx, deps, { command: 'register', sessionId, cwd })
+  const sys = out.options.find((o) => o.id.startsWith('system'))
+  ok(!!sys, 'register 菜单应有体系层那一行')
+  ok(sys.id.includes('takeover'), `接手行的 id 必须带 takeover（实际 ${sys.id}）`)
+  ok(sys.confirmation && sys.confirmation.confirmLabel, '接手仍要带确认浮层')
+  const proj = out.options.find((o) => o.id.startsWith('project'))
+  ok(!proj.id.includes('takeover'), '项目层没人占时不该带 takeover')
+}
+
 console.log(`[menu] 用例 ${passed} 条全部通过`)

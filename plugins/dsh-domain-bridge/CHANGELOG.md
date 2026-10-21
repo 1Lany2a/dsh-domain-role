@@ -3,6 +3,17 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.6] — 2026-10-21
+
+**复盘 0.8.5 时揪出来的三个真 bug（都是「界面说了、代码没做到」）。**
+
+- **菜单承诺"接手"，执行的却是"新注册"**：`/register` 弹窗里，体系层/项目层那一行在**别人在任**时文案是「成为体系主（接手 sess-xxx）」并弹「确认接任」，但选项 id 仍是 `system` / `project`（不带 `takeover`）⇒ 点下去 `force=false`，**必然撞冲突**。现在 id 跟着状态变：别人在任 ⇒ `system takeover` / `project takeover`；自己在任或无人 ⇒ 原样。补用例断言 id 必须带 `takeover`。
+- **`onDuty` 只认 owners**：主会话（体系主/项目主）登记在 `registrations` 里，而 `list_domain_*` 的 duties 只由 owners 算出 ⇒ 已登记的体系主显示 `onDuty:false`（2026-10-21 实测：本会话迁移账本后一直这样）。现在把注册册的角色并进同一张 duties 表（行形状与 owners 一致，多带 `layer`），读失败就只按 owners 算、绝不让 list 失败。
+- **`/initialize` 被说成会补 `SYSTEM-OVERVIEW.md`**：`/register system` 的引导文案与弹窗 tagline 都这么写，但初始化器对**体系层只检查、不创建**（`bootstrap.js:10`）。改成明说"该文件不会被自动创建，体系层文件要人手补或从模板拷"。
+
+另外把 `/resume` 菜单的一条边界说清楚：**别人的单会话暂停，本命令恢复不了**（session 级只指"你自己"）。以前菜单只显示"6 条被按下"、一行可点都没有；现在会写明其中几条是别人的，恢复要走 `set_domain_state(scope="session", …)`。
+
+`smoke` 284 / 55,559 · `commands` 60 · `menu` 51 · `lifecycle` 15 · `bootstrap` 16/121 · `registrations` 13/175 —— 全过。
 ## [0.8.5] — 2026-10-20
 
 **两件事一起修：主会话换届被当成域会话换届 ＋ 六条命令的弹窗点了没反应。**

@@ -167,7 +167,7 @@ function registerCommand(ctx, deps) {
           return reply(false, [
             `cwd 里没有体系口径源 SYSTEM-OVERVIEW.md：${cwd}`,
             '若这就是新建的体系根（骨架还没建），确认一次即可注册：',
-            '· `/register system --confirm`　（随后 `/initialize` 会补上 SYSTEM-OVERVIEW.md）',
+            '· `/register system --confirm`　（该文件**不会**被自动创建：`/initialize` 只建项目骨架，体系层文件要人手补或从模板拷）',
             '若走错目录了，请到体系根目录下的会话里执行，或改用 `/register project`。',
           ])
         }
