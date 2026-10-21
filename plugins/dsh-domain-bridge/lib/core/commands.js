@@ -25,7 +25,7 @@ import {
 import { loadDeclarations } from './declaration.js'
 import { loadDomainStates } from './pause.js'
 import { sessionOf, markRetired } from './session-factory.js'
-import { stateRoot } from './shared.js'
+import { stateRoot, webOrigin, isFullSessionId, isSessionIdLike } from './shared.js'
 import { warn } from './tools.js'
 
 const HANDOFF_DEFAULTS = {
@@ -320,7 +320,7 @@ function initializeCommand(ctx, deps) {
  *      只有 PROJECT.md / KNOWLEDGE.md / KNOWLEDGE\ / 提案\ / projectlog\ / .gitignore ⇒ 不能一律让人去找交接包；
  *   ② 交接**不写任何文件**（只调 create_domain_session 并写注册册）⇒ 不能写"交接参数由 /handoff 写入"。
  */
-function defaultHandoffTask({ layer, key, cwd }) {
+export function defaultHandoffTask({ layer, key, cwd }) {
   const layerWord = layer === 'system' ? '体系主会话' : layer === 'project' ? '项目主会话' : '域会话'
   const hasPack = Boolean(cwd) && fs.existsSync(path.join(cwd, '_registry', 'handoff.json'))
   const readLine = hasPack
@@ -334,47 +334,244 @@ function defaultHandoffTask({ layer, key, cwd }) {
   )
 }
 
+/** 已知的会话 id（在线顶层会话 ∪ 注册册 ∪ 在任声明）——短号解析只在**唯一命中**时接受。 */
+function knownSessionIds(ctx, deps) {
+  const ids = new Set()
+  try {
+    const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : ctx && ctx.agents
+    const roots = agents && typeof agents.roots === 'function' ? agents.roots() : []
+    for (const row of Array.isArray(roots) ? roots : []) if (row && row.id) ids.add(String(row.id))
+  } catch {
+    /* agents unavailable: the books below still answer */
+  }
+  try {
+    const read = readRegistrations(deps.config.domainsFile)
+    for (const row of listRegistrations(read.doc)) if (row.sessionId) ids.add(String(row.sessionId))
+  } catch {
+    /* ignore */
+  }
+  try {
+    const loaded = loadDeclarations(deps.config.domainsFile)
+    for (const row of (loaded && loaded.entries) || []) if (row && row.sessionId) ids.add(String(row.sessionId))
+  } catch {
+    /* ignore */
+  }
+  return [...ids]
+}
+
+/**
+ * 会话目标解析（v0.8.7 `target=<现存会话>` 用）：
+ *   · 完整 id（`session-<uuid>`）⇒ 原样接受，**不要求它现在在线**（离线会话也能接身份，只是拿不到活 Agent）；
+ *   · 短号 `sess-xxxxxxxx` / 片段 ⇒ 只在**唯一命中**一条已知会话时接受（宁可拒绝，也不猜错人）。
+ */
+function resolveSessionTarget(ctx, deps, raw) {
+  const value = textOf(raw)
+  if (!value) return { ok: false, text: 'target 为空：要么 `target=new`（新建），要么给一个会话 id。' }
+  if (isFullSessionId(value)) return { ok: true, id: value.trim() }
+  if (isSessionIdLike(value)) {
+    const prefix = `session-${value.trim().toLowerCase().replace(/^sess-?/, '')}`
+    const hits = knownSessionIds(ctx, deps).filter((id) => id.toLowerCase().startsWith(prefix))
+    if (hits.length === 1) return { ok: true, id: hits[0] }
+    if (hits.length === 0) return { ok: false, text: `没有已知会话匹配 \`${value}\`（在线顶层会话、注册册、在任声明三处都查过了）。`, candidates: [] }
+    return { ok: false, text: `短号 \`${value}\` 命中 ${hits.length} 条会话 ⇒ 不给猜，请给完整 id。`, candidates: hits }
+  }
+  return {
+    ok: false,
+    text: `target 要么是 \`new\`，要么是会话 id（\`session-<uuid>\` 或 \`sess-xxxxxxxx\`）；收到：\`${value}\``,
+  }
+}
+
+/** 某个会话属于哪个项目（注册册 → 在线 cwd；推不出就 null）。权限闸用它判"项目主能不能动这个会话"。 */
+function projectOfSession(ctx, deps, sessionId) {
+  try {
+    const read = readRegistrations(deps.config.domainsFile)
+    const doc = read.doc || { registrations: {}, owners: {} }
+    const role = identityOf(doc, sessionId).roles.find((row) => row.project)
+    if (role) return String(role.project).toLowerCase()
+  } catch {
+    /* fall through to cwd */
+  }
+  try {
+    const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : ctx && ctx.agents
+    const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : null
+    if (agent) {
+      const project = projectNameOf(callerCwd(ctx, agent))
+      if (project) return project
+    }
+  } catch {
+    /* treat as unknown */
+  }
+  return null
+}
+
+/** 这个会话现在有没有活 Agent（不看声明、不看索引）。 */
+function hasLiveAgent(ctx, sessionId) {
+  try {
+    const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : ctx && ctx.agents
+    return Boolean(agents && typeof agents.get === 'function' && agents.get(sessionId))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * `/handoff target=<会话id>`：把**在任身份**交给一个已经存在的会话。
+ * 只写注册册（体系/项目两层）；域层归 owners，注册册不碰（不造第二本台账）。
+ * 刻意**不唤醒**目标会话：唤醒语义属于 send_to_domain(wake=…)，交接不该顺手叫醒别人。
+ */
+async function handoffToExisting({ ctx, deps, agent, sessionId, identity, role, layer, key, target, retireNow, title }) {
+  const resolved = resolveSessionTarget(ctx, deps, target)
+  if (!resolved.ok) {
+    const lines = [resolved.text]
+    if (resolved.candidates && resolved.candidates.length) {
+      lines.push(`· 候选：${resolved.candidates.slice(0, 8).map((id) => `\`${id}\``).join('、')}`)
+    }
+    lines.push('· 也可以 `target=new` 新建一条接班会话。')
+    return reply(false, lines)
+  }
+  const targetId = resolved.id
+  if (targetId === sessionId) {
+    return reply(false, ['target 就是你自己 ⇒ 不用交接。要刷新在岗时间请裸跑 `/register`。'])
+  }
+  if (layer === 'domain') {
+    return reply(false, [
+      `域层（\`${key}\`）的负责人写在**在任声明**（owners）里，注册册只管体系/项目两层 ⇒ 这里不能直接转给别的会话。`,
+      `· 让对方窗口自己执行 \`/register domain ${key} takeover\`（它会写 owners 并留痕）。`,
+      '· 体系主 / 项目主的交接用 `target=<会话id>` 可以。',
+    ])
+  }
+  if (targetId === sessionId) {
+    return reply(false, ['target 就是你自己 ⇒ 不用交接。要刷新在岗时间请裸跑 `/register`。'])
+  }
+
+  const project = role && role.project ? role.project : String(key).split(':')[0]
+  const written = upsertRegistration(
+    deps.config.domainsFile,
+    {
+      layer,
+      project,
+      sessionId: targetId,
+      by: sessionId,
+      title,
+      note: `由 ${sessionId} 用 /handoff target= 交接`,
+    },
+    { force: true, by: sessionId },
+  )
+  if (!written.ok || !written.written) {
+    return reply(false, [
+      `交接失败：${written.error || written.reason || '未知原因'}`,
+      ...(written.hint ? [written.hint] : []),
+      '· 一个字都没写：在任身份还在你身上，可以重试或改用 `target=new`。',
+    ])
+  }
+  const owned = ownedDomains(deps.config.domainsFile, sessionId)
+  const live = hasLiveAgent(ctx, targetId)
+  const lines = [
+    `**交接完成**：\`${key}\` 的在任身份已转给 ${targetId}`,
+    `· 注册册已写：${(written.record && written.record.note) || '(已写入)'}`,
+    live
+      ? '· 那个窗口现在开着：切过去让它裸跑 `/register` 确认身份。'
+      : '· 那个窗口现在**没开**（离线会话没有活 Agent）⇒ 先人工点开它，再让它 `/register`。',
+    '· 没有走 create_domain_session：插件**不会**主动唤醒一个已存在的会话。',
+  ]
+  if (owned.length) {
+    lines.push(`· ⚠️ 你名下还有 ${owned.length} 个域的在任声明（${owned.map((row) => row.key).join('、')}），这次没有动它们。`)
+  }
+  if (retireNow) {
+    if (typeof deps.retireSelf === 'function') {
+      const retired = await deps.retireSelf({ agent, rawInput: '交接后立即退役（/handoff target=… retire=now）' })
+      lines.push('', '**前任退役（当场执行）**：', retired && retired.text ? retired.text : '（退役没有回执）')
+    } else {
+      lines.push('', '⚠️ retire=now 没有执行：退役实现不可用（插件未完整加载）⇒ 请手动 `/retire`。')
+    }
+  } else {
+    lines.push('', '⚠️ 你**还在任**：注册册是强制覆盖，但退役不会自己发生——确认对方接住了，就在本窗口 `/retire`。')
+  }
+  return reply(true, lines)
+}
+
 function handoffCommand(ctx, deps) {
   return {
     name: 'handoff',
     description: '开一个接班会话并转移职责（默认按参数表：体系 cordis / 项目 standard / 域 standard）',
-    input: { hint: '[model=provider/id] [preset=<id>] [perm=<档>] [target=new|<sessionId>] [task=文字]' },
+    input: { hint: '[wizard] | [key=<你持有的身份键>] [model=provider/id] [preset=<id>] [perm=<档>] [target=new|<会话id>] [title=文字] [task=文字] [retire=now]' },
     async handler(invocation) {
       const agent = invocation && invocation.agent
       const sessionId = callerId(agent)
       if (!sessionId) return reply(false, ['拿不到调用者会话 id，无法交接。'])
       const cwd = callerCwd(ctx, agent)
-      const parsed = parseFlags(words(invocation.rawInput))
+      const parsed = parseFlags(words(invocation && invocation.rawInput))
+      // v0.8.7：分步表单（`/handoff wizard` 打开的本地页面）把结构化参数直接交进来，
+      // 与命令行**共用这一份实现**——不写第二套建会话逻辑。
+      const given = (invocation && invocation.params) || {}
+      const param = (name) =>
+        given[name] !== undefined && given[name] !== null ? given[name] : parsed.values.get(name)
+
+      // 分步表单入口：只回一个本地页面地址，不建任何东西（宿主弹窗壳不支持链式多级，所以"多级"落在这里）。
+      if (parsed.rest[0] === 'wizard' || parsed.flags.has('wizard')) {
+        const origin = webOrigin(ctx)
+        if (!origin) {
+          return reply(false, [
+            '拿不到宿主 Web 端口 ⇒ 打不开分步表单。',
+            '可以直接用命令行参数：`/handoff model=provider/id preset=<id> perm=<档>`。',
+          ])
+        }
+        const url = `${origin}/api/dsh-domain-bridge/handoff-wizard?sessionId=${encodeURIComponent(sessionId)}`
+        return reply(true, [
+          '**分步设置交接参数**（一步步选，最后确认才建）：',
+          '',
+          url,
+          '',
+          '· 页面上能改：层级（只能在你**真持有**的身份里选）、模式、模型、权限档、标题、开工任务、建完是否顺手退役你。',
+          '· 表单只在 127.0.0.1 上可访问；它调的还是同一条交接实现，不是第二套。',
+        ])
+      }
+
       const read = readRegistrations(deps.config.domainsFile)
       const doc = read.doc || { registrations: {}, owners: [] }
       const identity = identityOf(doc, sessionId)
-      const layer = identity.roles.length ? identity.roles[0].layer : 'project'
-      const key = identity.roles.length ? identity.roles[0].key : `${projectNameOf(cwd) || 'unknown'}:main`
+      // 层与键：默认按当前身份的第一条；`key=` 只允许在**你真持有**的身份里选（不许替别人的键做主）。
+      // 优先取**非域层**（体系/项目）——一个会话可能同时持有域声明，而域交接不走注册册（见下方拒绝分支）。
+      const mainRoles = identity.roles.filter((row) => row.layer !== 'domain')
+      const wantedKey = textOf(param('key'))
+      let role = mainRoles.length ? mainRoles[0] : identity.roles.length ? identity.roles[0] : null
+      if (wantedKey) {
+        role = identity.roles.find((row) => String(row.key).toLowerCase() === wantedKey.toLowerCase()) || null
+        if (!role) {
+          return reply(false, [
+            `你并不持有 \`${wantedKey}\` 这个身份 ⇒ 不能拿它去交接。`,
+            `· 你现在持有：${identity.roles.map((row) => row.key).join('、') || '（没有任何注册身份）'}`,
+          ])
+        }
+      }
+      const layer = role ? role.layer : 'project'
+      const key = role ? role.key : `${projectNameOf(cwd) || 'unknown'}:main`
 
-      const modelValue = parsed.values.get('model') || null
+      const modelValue = textOf(param('model')) || null
       let model = null
       if (modelValue) {
         const slash = modelValue.indexOf('/')
         if (slash <= 0) return reply(false, [`model 要写成 provider/model，例如 \`wb/cn:deepseek-v4.1-flash\`；收到：${modelValue}`])
         model = { provider: modelValue.slice(0, slash), model: modelValue.slice(slash + 1) }
       }
-      const preset = parsed.values.get('preset') || HANDOFF_DEFAULTS.presets[layer] || 'standard'
+      const preset = textOf(param('preset')) || HANDOFF_DEFAULTS.presets[layer] || 'standard'
       // v0.8.5：权限档**默认跟随部署配置**（config.domainSessionPreset），不再在这里硬编码
       // danger-full-access —— 硬编码会悄悄盖掉 v0.6.4 把默认收窄到 workspace-write 的安全意图。
-      const perm = parsed.values.get('perm') || null
-      const target = parsed.values.get('target') || 'new'
+      const perm = textOf(param('perm')) || null
+      const target = textOf(param('target')) || 'new'
+      const retireNow = String(param('retire') ?? '') === 'now' || parsed.flags.has('retire-now')
+      const title =
+        textOf(param('title')) ||
+        `【${layer === 'system' ? '体系' : layer === 'project' ? '项目' : '域'}】${key} 接任`
 
-      if (target !== 'new') {
-        return reply(false, [
-          `v1 只支持「新建会话」交接（收到 target=${target}）。`,
-          '把职责交给一个**现存会话**还没做：`create_domain_session` 只能新建。',
-          '你可以先 `retire`，再让对方会话自己 `/register`；或直接 `create_domain_session` 新建。',
-        ])
+      // v0.8.7：**交给一个已经开着的会话**。v1 以前这里直接拒绝（"只能新建"），
+      // 于是"换届给已存在的窗口"这条最自然的路被堵死——只能先 retire 再让对方自己 /register。
+      if (!/^new$/i.test(target)) {
+        return handoffToExisting({ ctx, deps, agent, sessionId, identity, role, layer, key, target, retireNow, title })
       }
       if (!deps.defs || !deps.defs.create) return reply(false, ['create 工具不可用（插件未完整加载），无法新建接班会话。'])
 
-      const task = parsed.values.get('task') || defaultHandoffTask({ layer, key, cwd })
-      const retireNow = parsed.values.get('retire') === 'now' || parsed.flags.has('retire-now')
+      const task = textOf(param('task')) || defaultHandoffTask({ layer, key, cwd })
       const created = await deps.defs.create.execute(
         {
           // v0.8.5：**按层建会话**。以前这里把体系/项目键当域塞进 domain 参数、又不传 claim，
@@ -386,7 +583,7 @@ function handoffCommand(ctx, deps) {
           agentPreset: preset,
           ...(perm ? { permissionPreset: perm } : {}),
           ...(model ? { model } : {}),
-          title: `【${layer === 'system' ? '体系' : layer === 'project' ? '项目' : '域'}】${key} 接任`,
+          title,
           claim: true,
           allowExistingOwner: true,
         },
@@ -517,7 +714,7 @@ function pausedLines(deps, sessionId, name) {
     '',
     sessionPaused
       ? '⚠️ **你自己这一级被按着** ⇒ `/resume self` 才能恢复（别的层级解开也还压着你）。'
-      : `用法：\`/${name} self|domain <项目:域>|project|global\`（弹窗菜单里直接点，不用打）。`,
+      : `用法：\`/${name} self|domain <项目:域>|session <会话id>|project|global\`（弹窗菜单里直接点，不用打）。`,
   )
   return lines
 }
@@ -540,9 +737,9 @@ function stateCommand(ctx, deps, mode) {
   return {
     name,
     description: isPause
-      ? '按授权范围暂停协作活动（self/domain 任何人；project 需项目主或体系主；global 需体系主）'
+      ? '按授权范围暂停协作活动（self/domain/session 任何人；project 需项目主或体系主；global 需体系主）'
       : '按授权范围恢复协作活动（与 pause 同一套授权；按了几级就要抬几级）',
-    input: { hint: 'self|domain <项目:域>|project|global [原因]' },
+    input: { hint: 'self|domain <项目:域>|session <会话id>|project|global [原因]' },
     async handler(invocation) {
       const agent = invocation && invocation.agent
       const sessionId = callerId(agent)
@@ -553,29 +750,57 @@ function stateCommand(ctx, deps, mode) {
       // 没有这一屏的话"我到底按过什么"只能去翻 state 目录）。
       if (tokens.length === 0) return reply(true, pausedLines(deps, sessionId, name))
       // v0.8.5：加上 `domain <键>`——菜单里「按域」那一组要有个能真跑的命令接住它。
-      const domainKey = level === 'domain' ? (tokens[1] || '') : ''
-      const reason = (level === 'domain' ? tokens.slice(2) : tokens.slice(1)).join(' ')
-      if (!['self', 'domain', 'project', 'global'].includes(level)) {
+      // v0.8.7：加上 `session <会话id>`——"别人的单会话暂停"以前只能靠 set_domain_state 工具，没有命令入口。
+      const takesKey = level === 'domain' || level === 'session'
+      const rawKey = takesKey ? tokens[1] || '' : ''
+      const reason = tokens.slice(takesKey ? 2 : 1).join(' ')
+      if (!['self', 'domain', 'session', 'project', 'global'].includes(level)) {
         return reply(false, [
-          `用法：\`/${name} self|domain <项目:域>|project|global [原因]\``,
+          `用法：\`/${name} self|domain <项目:域>|session <会话id>|project|global [原因]\``,
           '· self＝只动自己（任何会话都能按）',
           '· domain＝动一个域（该域负责人、项目主或体系主可按下）',
+          '· session＝动某一条会话（自己 / 体系主 / 该会话所属项目的主会话）',
           '· project＝动整个项目（需项目主会话或体系主会话）',
           '· global＝动全局（需体系主会话）',
         ])
       }
-      if (level === 'domain' && !domainKey) {
+      if (level === 'domain' && !rawKey) {
         return reply(false, [`用法：\`/${name} domain <项目:域> [原因]\`（例如 \`/${name} domain tixiweihu:docs\`）`, '菜单里有按域的现成选项，不用手打。'])
+      }
+      let sessionKey = ''
+      if (level === 'session') {
+        if (!rawKey) {
+          return reply(false, [
+            `用法：\`/${name} session <会话id> [原因]\``,
+            '· 自己用 `self` 更短；动别人要给完整 id（`session-<uuid>`）或唯一短号（`sess-xxxxxxxx`）。',
+          ])
+        }
+        const resolved = resolveSessionTarget(ctx, deps, rawKey)
+        if (!resolved.ok) {
+          const lines = [resolved.text]
+          if (resolved.candidates && resolved.candidates.length) {
+            lines.push(`· 候选：${resolved.candidates.slice(0, 8).map((id) => `\`${id}\``).join('、')}`)
+          }
+          return reply(false, lines)
+        }
+        sessionKey = resolved.id
       }
       const cwd = callerCwd(ctx, agent)
       const gate = resolveGate(deps, sessionId, cwd)
-      const check = checkAuthority(gate, level, sessionId, { deps, domainKey })
+      const check = checkAuthority(gate, level, sessionId, {
+        deps,
+        domainKey: rawKey,
+        sessionKey,
+        sessionProject: sessionKey ? projectOfSession(ctx, deps, sessionKey) : null,
+      })
       if (!check.ok) return reply(false, check.lines)
       const target = level === 'self'
         ? { scope: 'session', key: sessionId }
-        : level === 'domain'
-          ? { scope: 'domain', key: check.key }
-          : { scope: level, key: level === 'global' ? '*' : check.project }
+        : level === 'session'
+          ? { scope: 'session', key: check.key || sessionKey }
+          : level === 'domain'
+            ? { scope: 'domain', key: check.key }
+            : { scope: level, key: level === 'global' ? '*' : check.project }
       if (!deps.defs || !deps.defs.pause) return reply(false, ['set_domain_state 不可用（插件未完整加载）。'])
       const result = await deps.defs.pause.execute(
         {
@@ -617,6 +842,51 @@ function resumeCommand(ctx, deps) {
   return stateCommand(ctx, deps, 'resume')
 }
 
+/* --------------------------------------------------- pause-all 的二次确认（v0.8.7 真做） */
+
+/**
+ * 二次确认的时效：60 秒。
+ * v0.8.0~0.8.6 这里只有文案——第一次调用只是回一句"请在 60 秒内再发一次"，服务端**不记任何状态**，
+ * 于是 `--confirm` 一次就能过、60 秒也从来没被检查过。现在把待确认落盘（一会话一文件）：
+ * 首次写、带 --confirm 时校验（同一层级 + 未超时）后再删。
+ */
+const PAUSE_ALL_TTL_MS = 60 * 1000
+
+function pauseAllPendingFile(config, sessionId) {
+  return path.join(stateRoot(config.stateDir), 'pause-all-pending', `${sessionId}.json`)
+}
+
+function writePauseAllPending(config, sessionId, payload) {
+  try {
+    const file = pauseAllPendingFile(config, sessionId)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, file)
+    return { ok: true, file }
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) }
+  }
+}
+
+function readPauseAllPending(config, sessionId) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pauseAllPendingFile(config, sessionId), 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function clearPauseAllPending(config, sessionId) {
+  try {
+    fs.rmSync(pauseAllPendingFile(config, sessionId), { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
 function pauseAllCommand(ctx, deps) {
   return {
     name: 'pause-all',
@@ -634,11 +904,40 @@ function pauseAllCommand(ctx, deps) {
       }
       if (!reason) return reply(false, ['`/pause-all` 必须写原因（会进审计）。例如：`/pause-all global 注入风险，先停住 原因`。'])
       if (level !== 'self' && !parsed.flags.has('confirm')) {
+        const wrote = writePauseAllPending(deps.config, sessionId, { scope: level, reason, at: new Date().toISOString() })
         return reply(true, [
           `这是**强制暂停 ${level}**，还没有执行。`,
           `确认请在 60 秒内再发一次：\`/pause-all ${level} ${reason} --confirm\``,
+          wrote.ok
+            ? '· 已记下这次待确认（60 秒后自动失效，且只认发起的这条会话）。'
+            : `· ⚠️ 待确认没落盘（${wrote.error}）⇒ 下一步的 --confirm 一定会被拒。`,
           '（任意已注册会话都可以发起；确认与原因会写审计。）',
         ])
+      }
+      if (level !== 'self') {
+        // v0.8.7：--confirm 必须**对得上刚才那次待确认**——不再"一次 --confirm 就能过"。
+        const pending = readPauseAllPending(deps.config, sessionId)
+        if (!pending) {
+          return reply(false, [
+            '没有待确认的强制暂停：`--confirm` 不能一步到位。',
+            `先发一次不带 --confirm 的：\`/pause-all ${level} ${reason}\``,
+          ])
+        }
+        if (String(pending.scope) !== level) {
+          return reply(false, [
+            `待确认的是 **${pending.scope}**，不是 ${level} ⇒ 拒执行（防"确认了 A 却执行 B"）。`,
+            `先发一次 \`/pause-all ${level} ${reason}\` 重新确认。`,
+          ])
+        }
+        const ageMs = Date.now() - Date.parse(pending.at)
+        if (!Number.isFinite(ageMs) || ageMs > PAUSE_ALL_TTL_MS) {
+          clearPauseAllPending(deps.config, sessionId)
+          return reply(false, [
+            '确认已过期（超过 60 秒）⇒ 没有执行。',
+            `重新来一次：先 \`/pause-all ${level} ${reason}\`，再在 60 秒内带 --confirm 发。`,
+          ])
+        }
+        clearPauseAllPending(deps.config, sessionId)
       }
       const cwd = callerCwd(ctx, agent)
       const gate = resolveGate(deps, sessionId, cwd)
@@ -666,6 +965,24 @@ function checkAuthority(gate, level, sessionId, extra = {}) {
     return { ok: false, lines: [`注册册读不懂（${gate.read.error}）⇒ 判不出身份，按规则拒绝。`, '先修好 _registry\\domains.json 再暂停。'] }
   }
   const { identity, project } = gate
+  if (level === 'session') {
+    // v0.8.7：单会话这一级支持**指定 id**（以前只能 `self`，别人的单会话暂停没有命令入口）。
+    // 授权：自己 ∪ 体系主 ∪ 该会话所属项目的主会话。
+    const key = String(extra.sessionKey || '').trim()
+    if (!key) return { ok: false, lines: ['要动哪一条会话？写法：`/pause session <会话id>`。'] }
+    if (key === sessionId) return { ok: true, key }
+    if (identity.systemMain) return { ok: true, key }
+    const projectOfTarget = String(extra.sessionProject || '').trim().toLowerCase()
+    if (projectOfTarget && identity.projectMains.includes(projectOfTarget)) return { ok: true, key }
+    return {
+      ok: false,
+      lines: [
+        `你（${sessionId}）既不是这条会话本身，也不是它的项目主或体系主 ⇒ 拒绝动它。`,
+        `· 目标：${key}${projectOfTarget ? `（项目 ${projectOfTarget}）` : '（推不出属于哪个项目）'}`,
+        '· 出路：让它自己 `/pause self`；或由体系主 / 该项目的项目主来按。',
+      ],
+    }
+  }
   if (level === 'domain') {
     // 域级暂停：**要求这个域真的存在**（域级暂停挂在声明册的一个 key 上，它不是"整台机器"或
     // "某个项目"级别的开关）；按下的人要么是该域负责人，要么是项目主 / 体系主。

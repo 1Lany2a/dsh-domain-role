@@ -11,7 +11,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 
 export const PLUGIN = 'dsh-domain-bridge'
-export const VERSION = '0.8.6'
+export const VERSION = '0.8.7'
 /**
  * v0.3.6 审计 traceId（项目规则 vibe-audit-logger-lite）：本次三处行为日志共用它，
  * 完整故事线落在 projectlog/2026-10-12-域桥v0.3.6-F1F2F4交接防混乱.md。
@@ -429,6 +429,39 @@ export function isFullSessionId(value) {
 /** 看起来是在说会话（`sess-…` / `session-…`）——用来决定"这里要不要报 unresolved"。 */
 export function isSessionIdLike(value) {
   return /^sess/i.test(String(value ?? '').trim())
+}
+
+/**
+ * 宿主 Web 服务的 origin（`http://127.0.0.1:<port>`），拿不到就 `null`。
+ * 只有"给人点开一个本地页面"这类场景需要它（例如 /handoff 的分步表单）；
+ * 取服务一律先 `ctx.get` 再属性读，两条路都不许抛——失效 fiber 上属性读会直接抛。
+ */
+export function webOrigin(ctx) {
+  let server = null
+  try {
+    if (ctx && typeof ctx.get === 'function') server = ctx.get('webServer')
+  } catch {
+    server = null
+  }
+  if (!server) {
+    try {
+      server = ctx ? ctx.webServer ?? null : null
+    } catch {
+      server = null
+    }
+  }
+  if (!server) return null
+  try {
+    if (typeof server.getOrigin === 'function') return String(server.getOrigin())
+  } catch {
+    /* fall back to the port form */
+  }
+  try {
+    if (server.port) return `${server.protocol || 'http:'}//127.0.0.1:${server.port}`
+  } catch {
+    /* treat as unavailable */
+  }
+  return null
 }
 
 /**

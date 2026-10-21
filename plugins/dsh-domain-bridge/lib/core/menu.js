@@ -15,6 +15,7 @@ import { readRegistrations, identityOf, projectOfCwd } from './registrations.js'
 import { loadDeclarations } from './declaration.js'
 import { loadDomainStates } from './pause.js'
 import { callerCwd } from './commands.js'
+import { wizardData, wizardHtml, runWizard } from './wizard.js'
 import { warn } from './tools.js'
 
 const ROUTE_PREFIX = '/api/dsh-domain-bridge'
@@ -190,6 +191,11 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
     return {
       ok: true,
       options: [
+        // v0.8.7：**逐项设置**。固定组合表达不了"模型 × 权限 × 模式"的组合爆炸，而宿主弹窗壳
+        // 选完一行必定关闭、没有链式多级的入口 ⇒ 多级落在这条本地分步表单上（确认才建）。
+        option('wizard', '逐项设置参数（打开分步表单）', '层级 / 模式 / 模型 / 权限 / 标题 / 任务 / 是否顺手退役——一步步选，最后一屏确认才建', {
+          group: group('wizard', '推荐 · 亲手改参数'),
+        }),
         option('', `建接班会话 · ${layerWord}（默认参数）`, '按参数表：体系 cordis／其余 standard；权限与模型取自部署配置', {
           group: group('who', `交给谁 · 按你现在的身份（${layerWord}）`),
           confirmation: {
@@ -305,23 +311,23 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
       entries = []
     }
     const others = entries.filter((row) => row.scope === 'session' && String(row.key) !== sessionId)
-    const actionable = entries.length - others.length
     const options = [
       option(
         '',
         '看当前暂停记录（只读）',
-        entries.length
-          ? `${entries.length} 条被按下${others.length ? `：其中 ${actionable} 条可用菜单恢复，${others.length} 条是别人的单会话` : ''}`
-          : '当前没有暂停记录',
+        entries.length ? `${entries.length} 条被按下（含 ${others.length} 条是别人的单会话）` : '当前没有暂停记录',
         { group: group('list', '状态 · 只读') },
       ),
     ]
-    // v0.8.6：**别人的单会话暂停，本命令恢复不了**（`/resume` 的 session 级只指"你自己"）。
-    // 以前这些记录被静默跳过，菜单只显示"6 条被按下"却一行可点都没有——现在明说这条边界。
-    if (others.length) {
+    // v0.8.6 只说"别人的单会话恢复不了"；v0.8.7 补上了命令入口（`/resume session <id>`），
+    // 所以这里直接把每条列成可点行——**能不能动由命令里的权限闸判**（自己 / 体系主 / 该项目主），
+    // 没权的人点了会拿到明确的拒绝说明，而不是菜单里假装不存在。
+    for (const row of others) {
+      const note = row.note || row.pauseNote ? String(row.note || row.pauseNote).slice(0, 60) : '已暂停'
+      const by = row.pausedBy ? shortId(row.pausedBy) : '未知'
       options.push(
-        option('', `看那 ${others.length} 条明细（恢复要人手动 / 用工具）`, '别人的单会话暂停：用 set_domain_state(scope="session", domain="<完整会话id>", state="active")', {
-          group: group('list', '状态 · 只读'),
+        option(`session ${row.key}`, `恢复会话 ${shortId(row.key)}`, `${note} · 由 ${by} 按下`, {
+          group: group('session-others', '按会话 · 别人的'),
         }),
       )
     }
@@ -454,6 +460,29 @@ function writeJson(res, status, value) {
   }
 }
 
+function writeHtml(res, status, body) {
+  try {
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(body)
+  } catch {
+    try {
+      res.end('')
+    } catch {
+      /* nothing left to do */
+    }
+  }
+}
+
+/** 活 Agent 查找（拿不到就 null，绝不抛）。表单与设置页都靠它确认"是本窗口在操作"。 */
+function liveAgentOf(ctx, sessionId) {
+  try {
+    const agentsService = serviceOf(ctx, 'agents')
+    return agentsService && typeof agentsService.get === 'function' ? agentsService.get(sessionId) : null
+  } catch {
+    return null
+  }
+}
+
 function localOnly(req) {
   const host = String(req.headers.host || '').toLowerCase()
   return host.startsWith('127.0.0.1:') || host.startsWith('localhost:') || host === '127.0.0.1' || host === 'localhost'
@@ -558,6 +587,66 @@ export function registerMenuRoutes(ctx, deps) {
         writeJson(res, 200, out)
       } catch (error) {
         writeJson(res, 200, { ok: false, kind: 'error', text: error?.message || String(error) })
+      }
+    },
+  })
+  // ── v0.8.7 换届向导（本地分步表单）：宿主弹窗壳不支持链式多级，多级只能落在这里。
+  // 三个路由都是 local-only；页面本身不联网，最后一步调的还是同一条 /handoff 实现。
+  const wizardQuery = (req) => {
+    try {
+      const url = new URL(String(req.url || '/'), 'http://127.0.0.1')
+      return String(url.searchParams.get('sessionId') || '')
+    } catch {
+      return ''
+    }
+  }
+  register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/handoff-wizard`,
+    handler: async (req, res) => {
+      if (!localOnly(req)) return writeHtml(res, 403, '<p>local-only</p>')
+      try {
+        const sessionId = wizardQuery(req)
+        const agent = sessionId ? liveAgentOf(ctx, sessionId) : null
+        if (!agent) {
+          return writeHtml(
+            res,
+            400,
+            '<!doctype html><meta charset="utf-8"><p style="font:15px system-ui;padding:24px">这条会话现在没有活 Agent（窗口已关或刚重启过）⇒ 表单不能建会话。请在自己的窗口里执行 <code>/handoff</code>。</p>',
+          )
+        }
+        const data = await wizardData(ctx, deps, { sessionId, cwd: callerCwd(ctx, agent) })
+        writeHtml(res, 200, wizardHtml(data))
+      } catch (error) {
+        writeHtml(res, 500, `<!doctype html><meta charset="utf-8"><p>向导生成失败：${String(error?.message || error).replace(/[<&]/g, '')}</p>`)
+      }
+    },
+  })
+  register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/handoff-wizard/data`,
+    handler: async (req, res) => {
+      if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
+      try {
+        const sessionId = wizardQuery(req)
+        const agent = sessionId ? liveAgentOf(ctx, sessionId) : null
+        if (!agent) return writeJson(res, 200, { ok: false, error: 'no-live-agent' })
+        writeJson(res, 200, await wizardData(ctx, deps, { sessionId, cwd: callerCwd(ctx, agent) }))
+      } catch (error) {
+        writeJson(res, 200, { ok: false, error: error?.message || String(error) })
+      }
+    },
+  })
+  register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/handoff-wizard/run`,
+    handler: async (req, res) => {
+      if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
+      const body = await readBody(req)
+      try {
+        writeJson(res, 200, await runWizard(ctx, deps, { sessionId: String(body.sessionId || ''), params: body }))
+      } catch (error) {
+        writeJson(res, 200, { ok: false, text: error?.message || String(error) })
       }
     },
   })

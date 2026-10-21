@@ -1,6 +1,6 @@
 # dsh-domain-bridge
 
-**域可达层 v0.8.5**（v0.7.0 起新增**斜杠命令**（v0.8.5 起七条：加了 `/resume`）、v0.8 起带**弹窗菜单**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
+**域可达层 v0.8.7**（v0.7.0 起新增**斜杠命令**（v0.8.5 起七条：加了 `/resume`）、v0.8 起带**弹窗菜单**、v0.8.7 起换届可**逐项设置**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
 
 > v0.4.2 一句话：**任一级被按下就拦，拦的时候把「是哪几级按的」全部说出来；解一级不够——得把压着目标的那几级都解开，才会重投。**
 
@@ -30,7 +30,7 @@
 | `set_model` | **（v0.6.0 新增）改一个会话的模型，下一轮请求生效**。`target` 缺省＝调用者自己，可写会话 id 或域键；执行顺序固定：**记全局默认 → `selectModel` → 恢复全局默认**，回执 `{ok, sessionId, target, applied:"next-request", previous, globalDefault:{before, after, restored}}`。宿主失败码原样带回；恢复失败如实写 `restored:false` + error。 |
 | `set_default_model` | **（v0.6.1 新增）显式改宿主的全局默认模型，且永不恢复**（与 `set_model` 相反）。`{provider, model, reasoningEffort?}`；实现＝读 `before` → `ctx.agentDefaultModel.saveSelection(next)` → 读 `after`。影响面：**之后新建的、且尚无会话级选择的 Agent**；回执 `{ok, before, after, source:"agentDefaultModel", note, saved, verified, applied}`——宿主在没有部署配置入口/`configEditor` 时 `saveSelection` 是**静默 no-op**，所以读回来不一致就如实报 `verified:false` / `applied:"not-observed"`，绝不假装成功。服务不可用 ⇒ `api-unavailable`，参数非法 ⇒ `invalid-model`。 |
 
-## 斜杠命令（v0.7.0 起；v0.8.0 起带弹窗菜单；v0.8.5 起菜单**零键入**、二三级选项由宿主侧状态算出）
+## 斜杠命令（v0.7.0 起；v0.8.0 起带弹窗菜单；v0.8.5 起菜单**零键入**、二三级选项由宿主侧状态算出；v0.8.7 起交接可**逐项设置**）
 
 七条宿主命令，命令体**只做编排**（转调上面的工具定义，没有第二套实现、也不经过模型）：
 
@@ -38,11 +38,13 @@
 | --- | --- |
 | `/register` | 把本会话注册为**体系主会话** / **项目主会话** / **域会话**（`domain <域> [takeover]` 转调 `claim_domain`）；不带参数＝只看当前身份与可选项 |
 | `/initialize [check]` | 生成 / 补全项目骨架：`PROJECT.md`、`KNOWLEDGE.md`、`KNOWLEDGE\`、`提案\`、`projectlog\`、`.gitignore` 标准条目——**只补缺失、绝不覆盖**；带 `check` 只报告、一个字节都不写 |
-| `/handoff [retire=now]` | 开一个接班会话并转移职责（默认参数表：体系 `cordis` / 项目 `standard` / 域 `standard`；模型与权限档取自部署配置）。`retire=now`＝**建成功后当场退役自己**（建失败什么都不动） |
+| `/handoff [wizard]` | 开一个接班会话并转移职责（默认参数表：体系 `cordis` / 项目 `standard` / 域 `standard`；模型与权限档取自部署配置）。`wizard` 打开**本地分步表单**逐项改参数；`target=<会话id>` 把在任身份交给**已经开着的**会话（不新建、不唤醒）；`key=<键>` 只能在你真持有的身份里选；`retire=now`＝建成功后当场退役自己 |
 | `/retire` | 结束自己的任职：撤注册 + 释放域 + **session 级暂停** + 会话自我改名「（已退役）」；不删历史 |
-| `/pause` | 暂停自己 / 一个域 / 本项目 / 全局（按身份闸；判不出身份就拒绝）；裸跑＝列出当前所有暂停记录（只读） |
-| `/resume` | **反向开关**：恢复自己 / 一个域 / 本项目 / 全局（与 `/pause` 同一套授权）；恢复时重新评估 OR，只重投不再被压着的排队消息 |
-| `/pause-all` | 紧急通道：强制暂停（必填原因 + `--confirm`，写 `stateDir/audit.jsonl`） |
+| `/pause` | 暂停自己 / 一条**会话**（`session <会话id>`）/ 一个域 / 本项目 / 全局（按身份闸；判不出身份就拒绝）；裸跑＝列出当前所有暂停记录（只读） |
+| `/resume` | **反向开关**：恢复自己 / 一条会话 / 一个域 / 本项目 / 全局（与 `/pause` 同一套授权）；恢复时重新评估 OR，只重投不再被压着的排队消息 |
+| `/pause-all` | 紧急通道：强制暂停（必填原因；`project`/`global` 要**在 60 秒内**补 `--confirm`——服务端记待确认，超时或层级不符一律拒绝），写 `stateDir/audit.jsonl` |
+
+**换届的逐项设置（v0.8.7）**：宿主弹窗壳选中一行后必定关闭、没有链式多级的入口，所以「一步步选」落在 `/handoff wizard` 打开的**本地页面**上（`GET /api/dsh-domain-bridge/handoff-wizard?sessionId=…`，仅 `127.0.0.1` 可访问、页面不联网）：身份 → 模式 → 模型（从宿主可用目录里现查，也可手填 `provider/model`）→ 权限档 → 标题与开工任务 → 是否顺手退役我 → **最后一屏确认才建**。它调的是同一条 `/handoff` 实现（`invocation.params` 直传），**不是第二套**。
 
 **顺序约定：注册在前、初始化在后。** 注册键就是 cwd 目录名，初始化的产出**不参与**推导——所以空目录（新建项目 / 新体系根）也能先注册，`/initialize` 随后把骨架建起来。只有 `/register system` 在目录里没有 `SYSTEM-OVERVIEW.md` 时要一次显式确认（`--confirm`）：自封体系主会拿到 `/pause global` 权限，值得按一下。
 

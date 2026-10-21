@@ -396,7 +396,7 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.8.6', `package.json 版本不对（实际 ${pkg.version}）`)
+eq(pkg.version, '0.8.7', `package.json 版本不对（实际 ${pkg.version}）`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 

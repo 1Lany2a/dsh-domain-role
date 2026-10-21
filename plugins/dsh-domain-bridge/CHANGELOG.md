@@ -3,6 +3,41 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.7] — 2026-10-21
+
+**换届能逐项改参数了（本地分步表单）＋ 三个「说了没做」的口子合上。**
+
+### 一、换届向导：`/handoff wizard`
+
+宿主弹窗壳（`popupSelect`）选中一行后**必定关闭并消耗命令 token**，没有链式开下一个弹窗的入口（读 `ui-commands` 的 `PopupSelectController.settle` 确认），所以"多级"不能做在弹窗里。改成一条**本地页面**：`/handoff wizard` 回一个 `http://127.0.0.1:<port>/api/dsh-domain-bridge/handoff-wizard?sessionId=…` 链接，页面里六屏——身份 → 模式 → 模型 → 权限档 → 标题/开工任务/是否顺手退役 → 确认。
+
+- 页面**不联网、不引外部资源**，只在 `127.0.0.1` 可访问；会话没有活 Agent 时直接拒绝（不建任何东西）。
+- 模型列表从宿主真实目录现查（`sessionController.modelCatalog()` → `llm.listProviders/listModels()`），也可手填 `provider/model`；权限档列出 `read-only` / `workspace-write` / `danger-full-access` 与"部署默认"。
+- 提交走 `invocation.params` **直传同一条 `/handoff` 实现**（`rawInput` 为空），带空格的任务文本不会被命令行切坏；没有第二套建会话逻辑。
+- 层级只能在你**真持有**的身份里选（新增 `key=` 参数，同样受此约束）；默认优先取非域层身份——一个会话同时持有域声明时，不会再默认去交"域"。
+
+### 二、`/handoff target=<现存会话>`
+
+v1 起这里直接拒绝（"只能新建"），于是"换届给一个已经开着的窗口"只能先 `retire` 再让对方自己 `/register`。现在真的支持：
+
+- 完整 `session-<uuid>` 原样接受（**不要求在线**）；`sess-xxxxxxxx` 短号只在**唯一命中**时接受，命中多条就拒绝并给候选（不猜人）。
+- 只写注册册（体系/项目两层），**域层仍归 owners** ⇒ 收到域层身份时明确拒绝并给替代路（让对方 `/register domain <键> takeover`）。
+- 强制覆盖会把前任写进 `note` 留痕；默认提醒"你还在任、退役不会自己发生"。
+- 刻意**不唤醒**目标会话：唤醒语义属于 `send_to_domain(wake=…)`，交接不该顺手叫醒别人。
+
+### 三、`/pause session <会话id>` / `/resume session <会话id>`
+
+以前 session 这一级只有"你自己"，别人的单会话暂停**没有命令入口**（只能 `set_domain_state` 工具）。现在：
+
+- 授权＝**自己 ∪ 体系主 ∪ 该会话所属项目的主会话**（项目从注册册/在线 cwd 推；推不出只认体系主）。
+- 恢复仍是同一份实现（`stateCommand` 两个方向），`/resume` 菜单把"别人的单会话"直接列成可点行，点了没权会拿到明确拒绝说明，而不是假装不存在。
+
+### 四、`/pause-all` 的 60 秒确认**真做了**
+
+以前只有文案：第一次调用只回一句"请在 60 秒内再发一次"，服务端**不记任何状态**，于是 `--confirm` 一次就能过、60 秒从来没被检查。现在待确认落盘（`stateDir/pause-all-pending/<sessionId>.json`），`--confirm` 必须对得上：没有待确认 / 层级不符 / 超过 60 秒一律拒绝，执行前删掉记录。
+
+`smoke` 284 / 55,559 · `commands` 87 · `menu` 51 · `lifecycle` 15 · `bootstrap` 16/121 · `registrations` 13/175 · `wizard` 31 —— 全过。
+
 ## [0.8.6] — 2026-10-21
 
 **复盘 0.8.5 时揪出来的三个真 bug（都是「界面说了、代码没做到」）。**
