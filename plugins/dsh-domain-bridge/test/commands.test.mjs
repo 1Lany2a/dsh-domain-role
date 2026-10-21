@@ -191,4 +191,42 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(!doc.registrations['--takeover:main'], '--takeover 不能被当成项目名写成脏键')
 }
 
+// 16. /resume 存在，且把 state=active 传给同一个 set_domain_state 定义
+{
+  calls.length = 0
+  const out = await run('resume', 'self')
+  caseOk(out.kind === 'success', '/resume 应成功')
+  caseOk(calls[0][1].state === 'active' && calls[0][1].scope === 'session', '恢复应传 state=active / scope=session')
+}
+
+// 17. 裸跑 /pause 与 /resume 是只读的一屏：列出真的被按下的，且零写操作
+{
+  const { writeDomainStateAtomic } = await import('../lib/core/pause.js')
+  writeDomainStateAtomic(stateDir, 'session-test', { paused: true, pausedAt: new Date().toISOString(), pausedBy: 'session-test', pauseNote: '测试用' }, 'session')
+  calls.length = 0
+  const out = await run('resume', '')
+  caseOk(out.kind === 'success' && out.text.includes('当前的暂停记录'), '裸跑 /resume 应列出暂停记录')
+  caseOk(out.text.includes('session-test'), '记录里应列出被按下的键')
+  caseOk(out.text.includes('就是你'), '自己那一级被按下时要标出来')
+  caseOk(calls.length === 0, '裸跑 /resume 不能触发任何写操作')
+}
+
+// 18. /handoff 默认任务文案：不能假设有体系交接包，也不能说"交接参数由 /handoff 写入"
+{
+  calls.length = 0
+  await run('handoff', '')
+  const args = calls.find((c) => c[0] === 'create')?.[1]
+  caseOk(!args.task.includes('交接参数由 /handoff 写入'), '不能再说"交接参数由 /handoff 写入"（它不写任何文件）')
+  caseOk(args.task.includes('_registry\\handoff.json') && args.task.includes('不用去找'), '这个 cwd 没有交接包时应明确说不用去找')
+  caseOk(args.task.includes('注册册'), '应说明在任身份只在注册册里')
+}
+
+// 19. /handoff retire=now：建成功后当场退役（复用 /retire 同一份实现）
+{
+  calls.length = 0
+  const out = await run('handoff', 'retire=now')
+  caseOk(out.kind === 'success', 'retire=now 应成功')
+  caseOk(out.text.includes('前任退役（当场执行）'), '回执应说明当场退役')
+  caseOk(out.text.includes('退役≠删除') || out.text.includes('已按 session 级暂停'), '退役实现应真的跑过')
+}
 console.log(`[commands] 用例 ${passed} 条全部通过`)

@@ -13,6 +13,7 @@
 
 import { readRegistrations, identityOf, projectOfCwd } from './registrations.js'
 import { loadDeclarations } from './declaration.js'
+import { loadDomainStates } from './pause.js'
 import { callerCwd } from './commands.js'
 import { warn } from './tools.js'
 
@@ -208,6 +209,20 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
             acknowledgeLabel: '我知道这是最高权限',
           },
         }),
+        // v0.8.5：把"前任要不要当场退役"变成一次显式选择——默认不动（先确认接任者没建错），
+        // 但这台机器上"等人回来手动 /retire"从来没发生过，所以给一条一步到位的路。
+        option('retire=now', '建完立刻退役我（交接 + 退役一步到位）', '建成功后才退役；建失败则什么都不动', {
+          group: group('then', '建完之后'),
+          confirmation: {
+            title: '确认「建完就退役我」？',
+            description:
+              '接班会话建成功后，本会话会立刻执行退役（撤注册 + 释放域 + session 暂停 + 标题加「（已退役）」）。' +
+              '如果接任者建错了，你就没有在任的前任兜底了。',
+            confirmLabel: '确认建完就退役',
+            cancelLabel: '取消',
+            acknowledgeLabel: '我知道这会把兜底的前任一起收掉',
+          },
+        }),
       ],
     }
   }
@@ -273,6 +288,43 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
           : {}),
       }),
     )
+    return { ok: true, options }
+  }
+
+  if (command === 'resume') {
+    // 恢复面：只列**现在真的被按下的**那些（读 state 目录，不猜），按层级分组；
+    // 没有暂停记录时给一行只读提示，而不是让人对空菜单瞎点。
+    let entries = []
+    try {
+      const states = loadDomainStates(config.stateDir)
+      entries = (states && Array.isArray(states.entries) ? states.entries : []).filter((row) => row && row.paused === true)
+    } catch {
+      entries = []
+    }
+    const options = [
+      option('', '看当前暂停记录（只读）', entries.length ? `${entries.length} 条被按下` : '当前没有暂停记录', {
+        group: group('list', '状态 · 只读'),
+      }),
+    ]
+    let ownPaused = false
+    for (const row of entries) {
+      // 兼容旧记录：v0.8.5 之前 /retire 把原因写成 `pauseNote`（输出名，读不回来）；
+      // 现在两个名字都认，别让历史记录显示成空。
+      const note = row.note || row.pauseNote ? String(row.note || row.pauseNote).slice(0, 80) : '已暂停'
+      if (row.scope === 'domain') {
+        options.push(option(`domain ${row.key}`, `恢复域 ${row.key}`, note, { group: group('domain', '按域') }))
+      } else if (row.scope === 'project') {
+        options.push(option('project', `恢复项目 ${row.key}`, note, { group: group('project', '按项目') }))
+      } else if (row.scope === 'global') {
+        options.push(option('global', '恢复全局（所有会话）', note, { group: group('global', '全局') }))
+      } else if (row.scope === 'session' && String(row.key) === sessionId) {
+        ownPaused = true
+        options.push(option('self', '恢复我自己（这个窗口被按着）', note, { group: group('session', '按会话') }))
+      }
+    }
+    if (!ownPaused) {
+      options.push(option('self', '恢复我自己（当前没被按下，执行是无害空操作）', '只有在你自己这一级被按下时才需要', { group: group('session', '按会话') }))
+    }
     return { ok: true, options }
   }
 
@@ -417,7 +469,7 @@ export function registerMenuRoutes(ctx, deps) {
         if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
         const commands = serviceOf(ctx, 'commands')
         const agentsService = serviceOf(ctx, 'agents')
-        const names = ['register', 'initialize', 'handoff', 'retire', 'pause', 'pause-all']
+        const names = ['register', 'initialize', 'handoff', 'retire', 'pause', 'resume', 'pause-all']
         const present = {}
         for (const name of names) present[name] = false
         let checked = 0

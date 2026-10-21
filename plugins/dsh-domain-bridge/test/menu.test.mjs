@@ -108,4 +108,26 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(system.active === true, '自己已在任应标 active')
 }
 
+// 8. resume 菜单只列**真的被按下的**那些，并按层级给出恢复行
+{
+  const { writeDomainStateAtomic } = await import('../lib/core/pause.js')
+  writeDomainStateAtomic(config.stateDir, 'qidongchengxu:asr', { paused: true, pausedAt: new Date().toISOString(), pausedBy: 'sess-presser', note: '注入风险，先停住' }, 'domain')
+  writeDomainStateAtomic(config.stateDir, sessionId, { paused: true, pausedAt: new Date().toISOString(), pausedBy: sessionId, note: '自己这一级' }, 'session')
+  const out = buildMenuOptions(ctx, deps, { command: 'resume', sessionId, cwd })
+  const ids = out.options.map((o) => o.id)
+  ok(ids.includes('domain qidongchengxu:asr'), 'resume 应列出被按下的域')
+  ok(ids.includes('self'), '自己那一级被按下时应给出 self')
+  ok(out.options.find((o) => o.id === '').detail.includes('2'), '只读行应报告被按下的条数')
+  ok(out.options.find((o) => o.id === 'domain qidongchengxu:asr').detail.includes('注入风险'), '恢复行应带暂停备注')
+  ok(ids.every((id) => typeof id === 'string'), '恢复行的 id 必须能直接当命令参数')
+}
+
+// 9. handoff 菜单把"前任要不要当场退役"变成一次显式选择
+{
+  const out = buildMenuOptions(ctx, deps, { command: 'handoff', sessionId, cwd })
+  const row = out.options.find((o) => o.id === 'retire=now')
+  ok(!!row, 'handoff 应有「建完立刻退役我」那一行')
+  ok(row.confirmation && row.confirmation.confirmLabel, '一步到位必须带确认')
+  ok(out.options.some((o) => o.group.name === 'then'), '它应落在「建完之后」分组里')
+}
 console.log(`[menu] 用例 ${passed} 条全部通过`)

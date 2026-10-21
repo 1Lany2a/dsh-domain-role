@@ -23,6 +23,7 @@ import {
   listRegistrations,
 } from './registrations.js'
 import { loadDeclarations } from './declaration.js'
+import { loadDomainStates } from './pause.js'
 import { sessionOf, markRetired } from './session-factory.js'
 import { stateRoot } from './shared.js'
 import { warn } from './tools.js'
@@ -313,6 +314,26 @@ function initializeCommand(ctx, deps) {
 
 /* ----------------------------------------------------------------- /handoff */
 
+/**
+ * 交接默认任务文案（v0.8.5 修两处不成立的说法）：
+ *   ① `_registry\` 只有**体系根**才有；独立项目根（例如 E:\test）是 `/initialize` 建的骨架，
+ *      只有 PROJECT.md / KNOWLEDGE.md / KNOWLEDGE\ / 提案\ / projectlog\ / .gitignore ⇒ 不能一律让人去找交接包；
+ *   ② 交接**不写任何文件**（只调 create_domain_session 并写注册册）⇒ 不能写"交接参数由 /handoff 写入"。
+ */
+function defaultHandoffTask({ layer, key, cwd }) {
+  const layerWord = layer === 'system' ? '体系主会话' : layer === 'project' ? '项目主会话' : '域会话'
+  const hasPack = Boolean(cwd) && fs.existsSync(path.join(cwd, '_registry', 'handoff.json'))
+  const readLine = hasPack
+    ? '先读 `_registry\\handoff.json`（体系交接包）与 `PROJECT.md` §当前状态，再按 §下一步 开工。'
+    : '先读 `PROJECT.md` §当前状态 与 §下一步 开工（这个目录**没有**体系交接包 `_registry\\handoff.json`，不用去找）。'
+  return (
+    `（换届接任）你接手 **${key}**（${layerWord}）。` +
+    readLine +
+    '本会话的 preset／权限档／模型已在建会话时设置好，不需要你再配；' +
+    '交接**没有**写任何交接文件——在任身份只在注册册（registrations）里，裸跑 `/register` 可核对。'
+  )
+}
+
 function handoffCommand(ctx, deps) {
   return {
     name: 'handoff',
@@ -352,8 +373,8 @@ function handoffCommand(ctx, deps) {
       }
       if (!deps.defs || !deps.defs.create) return reply(false, ['create 工具不可用（插件未完整加载），无法新建接班会话。'])
 
-      const task = parsed.values.get('task') ||
-        `（换届接任）你接手 **${key}**。先读 _registry\\handoff.json 与 PROJECT.md §当前状态，再按 §下一步 开工；交接参数由 /handoff 写入。`
+      const task = parsed.values.get('task') || defaultHandoffTask({ layer, key, cwd })
+      const retireNow = parsed.values.get('retire') === 'now' || parsed.flags.has('retire-now')
       const created = await deps.defs.create.execute(
         {
           // v0.8.5：**按层建会话**。以前这里把体系/项目键当域塞进 domain 参数、又不传 claim，
@@ -376,10 +397,28 @@ function handoffCommand(ctx, deps) {
       lines.push(
         '',
         ownerChanged
-          ? `· 在任身份已转给新会话（${created.claim.outcome}）——**前任不会自动退役**：先确认接班会话真的建对了，再执行 \`/retire\`。`
+          ? `· 在任身份已转给新会话（${created.claim.outcome}）。`
           : '· ⚠️ 在任身份**没有**转成（见回执 claim），先看回执再决定。',
         '· 新窗口要你自己在左侧栏点开：宿主没有 Host→前台 的导航通道。',
       )
+      // v0.8.5：**「前任不会自己退役」是真的**——没有任何机制会因为"新会话收到了回执"就把旧会话停掉。
+      // 所以把这件事变成一次显式选择：默认不动（S4-A：先确认接任者没建错），或当场退役（retire=now）。
+      if (created && created.created === true) {
+        if (retireNow) {
+          if (typeof deps.retireSelf === 'function') {
+            const retired = await deps.retireSelf({ agent, rawInput: '交接后立即退役（/handoff retire=now）' })
+            lines.push('', '**前任退役（当场执行）**：', retired && retired.text ? retired.text : '（退役没有回执）')
+          } else {
+            lines.push('', '⚠️ retire=now 没有执行：退役实现不可用（插件未完整加载）⇒ 请手动 `/retire`。')
+          }
+        } else {
+          lines.push(
+            '',
+            '⚠️ **本会话还在任**：退役不会自己发生。确认新窗口真的建对了，就在**本窗口**执行 `/retire`；',
+            '   想一步到位的话，下次直接选菜单里那条「建完立刻退役我」。',
+          )
+        }
+      }
       return reply(true, lines)
     },
   }
@@ -424,7 +463,9 @@ function retireCommand(ctx, deps) {
           paused: true,
           pausedAt: new Date().toISOString(),
           pausedBy: sessionId,
-          pauseNote: `退役：${reason}`,
+          // 落盘字段名是 `note`（normalizeDomainState 只认它）；写成 pauseNote 会**读不回来**——
+          // 那是输出名。v0.8.5 修：以前 /retire 写的退役原因在 list_* 里一直是空的。
+          note: `退役：${reason}`,
         }, 'session')
         lines.push(st && st.ok ? '· 已按 session 级暂停（退役标记）' : `· session 级暂停失败：${(st && st.error) || '?'}`)
       } catch (error) {
@@ -448,18 +489,59 @@ function retireCommand(ctx, deps) {
 
 /* ------------------------------------------------------------- /pause family */
 
-function resolveGate(deps, sessionId, cwd) {
-  const read = readRegistrations(deps.config.domainsFile)
+/**
+ * 只读一屏：现在**真的被按下的**每一级（来自 state 目录，不猜、不缓存）。
+ * `/pause` 与 `/resume` 裸跑都走这里——恢复功能有了，就得能一眼看出"按过什么、谁按的、什么时候"。
+ */
+function pausedLines(deps, sessionId, name) {
+  const scopeWord = { domain: '域', session: '单会话', project: '项目', global: '全局' }
+  const lines = []
+  let entries = []
+  try {
+    const states = loadDomainStates(deps?.config?.stateDir)
+    entries = (states && Array.isArray(states.entries) ? states.entries : []).filter((row) => row && row.paused === true)
+  } catch {
+    entries = []
+  }
+  lines.push(`**当前的暂停记录**：${entries.length ? `${entries.length} 条` : '没有'}`)
+  for (const row of entries) {
+    const who = row.pausedBy ? `由 ${row.pausedBy}` : '（未记录谁按的）'
+    const when = row.pausedAt ? new Date(row.pausedAt).toLocaleString('zh-CN') : '（未记录时间）'
+    const mine = row.scope === 'session' && String(row.key) === sessionId ? '　← 就是你' : ''
+    lines.push(`· [${scopeWord[row.scope] || row.scope}] \`${row.key}\`　${who}，${when}${mine}`)
+    const reason = row.note || row.pauseNote
+    if (reason) lines.push(`  · 备注：${reason}`)
+  }
+  const sessionPaused = entries.some((row) => row.scope === 'session' && String(row.key) === sessionId)
+  lines.push(
+    '',
+    sessionPaused
+      ? '⚠️ **你自己这一级被按着** ⇒ `/resume self` 才能恢复（别的层级解开也还压着你）。'
+      : `用法：\`/${name} self|domain <项目:域>|project|global\`（弹窗菜单里直接点，不用打）。`,
+  )
+  return lines
+}
+
+function resolveGate(deps, sessionId, cwd) {  const read = readRegistrations(deps.config.domainsFile)
   const doc = read.doc || { registrations: {}, owners: [] }
   const identity = identityOf(doc, sessionId)
   const project = projectNameOf(cwd)
   return { read, identity, project }
 }
 
-function pauseCommand(ctx, deps) {
+/**
+ * `/pause` 与 `/resume` 是同一个开关的两头（v0.8.5 补上恢复：以前只有"按下去"、没有"抬起来"，
+ * 恢复只能记 `set_domain_state(state=active)` 那条工具调用）。**一份实现两个命令**，避免口径漂移。
+ */
+function stateCommand(ctx, deps, mode) {
+  const isPause = mode === 'pause'
+  const name = isPause ? 'pause' : 'resume'
+  const targetState = isPause ? 'paused' : 'active'
   return {
-    name: 'pause',
-    description: '按授权范围暂停协作活动（self/domain 任何人；project 需项目主或体系主；global 需体系主）',
+    name,
+    description: isPause
+      ? '按授权范围暂停协作活动（self/domain 任何人；project 需项目主或体系主；global 需体系主）'
+      : '按授权范围恢复协作活动（与 pause 同一套授权；按了几级就要抬几级）',
     input: { hint: 'self|domain <项目:域>|project|global [原因]' },
     async handler(invocation) {
       const agent = invocation && invocation.agent
@@ -467,14 +549,23 @@ function pauseCommand(ctx, deps) {
       if (!sessionId) return reply(false, ['拿不到调用者会话 id。'])
       const tokens = words(invocation.rawInput)
       const level = (tokens[0] || '').toLowerCase()
-      // v0.8.5：加上 `domain <键>`——菜单里「按域暂停」一行要有个能真跑的命令接住它。
+      // 裸跑 `/pause` 或 `/resume`＝只读：列出**现在真的被按下的**每一级（v0.8.5 加的恢复面，
+      // 没有这一屏的话"我到底按过什么"只能去翻 state 目录）。
+      if (tokens.length === 0) return reply(true, pausedLines(deps, sessionId, name))
+      // v0.8.5：加上 `domain <键>`——菜单里「按域」那一组要有个能真跑的命令接住它。
       const domainKey = level === 'domain' ? (tokens[1] || '') : ''
       const reason = (level === 'domain' ? tokens.slice(2) : tokens.slice(1)).join(' ')
       if (!['self', 'domain', 'project', 'global'].includes(level)) {
-        return reply(false, ['用法：`/pause self|domain <项目:域>|project|global [原因]`', '· self＝只暂停自己（任何会话都能按）', '· domain＝暂停一个域（该域负责人、项目主或体系主可按下）', '· project＝暂停整个项目（需项目主会话或体系主会话）', '· global＝暂停全局（需体系主会话）'])
+        return reply(false, [
+          `用法：\`/${name} self|domain <项目:域>|project|global [原因]\``,
+          '· self＝只动自己（任何会话都能按）',
+          '· domain＝动一个域（该域负责人、项目主或体系主可按下）',
+          '· project＝动整个项目（需项目主会话或体系主会话）',
+          '· global＝动全局（需体系主会话）',
+        ])
       }
       if (level === 'domain' && !domainKey) {
-        return reply(false, ['用法：`/pause domain <项目:域> [原因]`（例如 `/pause domain tixiweihu:docs`）', '菜单里有按域的现成选项，不用手打。'])
+        return reply(false, [`用法：\`/${name} domain <项目:域> [原因]\`（例如 \`/${name} domain tixiweihu:docs\`）`, '菜单里有按域的现成选项，不用手打。'])
       }
       const cwd = callerCwd(ctx, agent)
       const gate = resolveGate(deps, sessionId, cwd)
@@ -487,19 +578,43 @@ function pauseCommand(ctx, deps) {
           : { scope: level, key: level === 'global' ? '*' : check.project }
       if (!deps.defs || !deps.defs.pause) return reply(false, ['set_domain_state 不可用（插件未完整加载）。'])
       const result = await deps.defs.pause.execute(
-        { domain: target.key, scope: target.scope, state: 'paused', note: reason || '人工暂停（/pause）', confirm: target.scope === 'global' ? true : undefined },
+        {
+          domain: target.key,
+          scope: target.scope,
+          state: targetState,
+          note: reason || (isPause ? '人工暂停（/pause）' : '人工恢复（/resume）'),
+          confirm: target.scope === 'global' ? true : undefined,
+        },
         { agent },
       )
+      if (!isPause) {
+        return reply(true, [
+          `**恢复已执行**：${level}${level === 'global' ? '' : `（${target.key}）`}`,
+          '· 政策轴＝活动。恢复时**重新评估 OR**：只重投「现在不再被任何一级压着」的排队消息，',
+          '  仍被别的级压着的保持 pending（回执里 drain.stillPausedBy 会列出来）。',
+          '· ⚠️ 恢复不会自己唤醒离线会话——被按下的目标不会被别人自动叫醒。',
+          '',
+          '```json', JSON.stringify(result, null, 2), '```',
+        ])
+      }
       return reply(true, [
         `**暂停已设置**：${level}${level === 'global' ? '' : `（${target.key}）`}`,
         '· 政策轴＝已暂停：新的插件介导投递/新建会话会被拦下并落盘入队。',
         '· ⚠️ **正在跑的回合不会被打断**——暂停是政策闸，不是中断器。',
         '',
         '```json', JSON.stringify(result, null, 2), '```',
-        '恢复：`/pause` 的反向操作目前请用 `set_domain_state(scope=…, domain=…, state=active)`（v1 没做 /resume，避免命令膨胀）。',
+        '恢复：`/resume <同一层级>`（菜单里有），不用再记工具调用。',
       ])
     },
   }
+}
+
+function pauseCommand(ctx, deps) {
+  return stateCommand(ctx, deps, 'pause')
+}
+
+function resumeCommand(ctx, deps) {
+  return stateCommand(ctx, deps, 'resume')
 }
 
 function pauseAllCommand(ctx, deps) {
@@ -618,15 +733,19 @@ function appendAudit(config, record) {
 
 /* ---------------------------------------------------------------- registration */
 
-/** Build the six command definitions (pure; no host calls). */
+/** Build the seven command definitions (pure; no host calls). */
 export function buildCommandDefs(ctx, deps) {
+  // retire 先建：handoff 的「交接后立刻退役我」要**复用同一份退役实现**，不能再写一份。
+  const retire = retireCommand(ctx, deps)
+  const shared = { ...deps, retireSelf: retire.handler }
   return [
-    registerCommand(ctx, deps),
-    initializeCommand(ctx, deps),
-    handoffCommand(ctx, deps),
-    retireCommand(ctx, deps),
-    pauseCommand(ctx, deps),
-    pauseAllCommand(ctx, deps),
+    registerCommand(ctx, shared),
+    initializeCommand(ctx, shared),
+    handoffCommand(ctx, shared),
+    retire,
+    pauseCommand(ctx, shared),
+    resumeCommand(ctx, shared),
+    pauseAllCommand(ctx, shared),
   ]
 }
 

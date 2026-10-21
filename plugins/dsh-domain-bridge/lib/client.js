@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
       { name: 'handoff' },
       { name: 'retire' },
       { name: 'pause' },
+      { name: 'resume' },
       { name: 'pause-all' },
     ]
 
