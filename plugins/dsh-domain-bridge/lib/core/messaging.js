@@ -22,6 +22,25 @@ export const INBOX_PENDING = 'pending'
 export const INBOX_DELIVERED = 'delivered'
 export const INBOX_FAILED = 'failed'
 export const INBOX_WITHDRAWN = 'withdrawn'
+/**
+ * F-18（2026-10-24）：`delivering` = **投递中的中间态**（租约），不是第四个终态。
+ *
+ * 契约变化（INV-05 必须照这个读）：终态**仍然只有** `delivered` / `failed` / `withdrawn`；
+ * `delivering` 只在一段**有上限的窗口**内出现（`claimInboxDelivery()` 拿到租约 ⇒ 投递 ⇒
+ * `updateInboxStatus()` 落到终态）。它存在的唯一理由是让"同一份 pending 快照被两路 drain 各投一次"
+ * 变成"后到的那一路读到租约就跳过"；顺带让**崩溃**留下的记录可被下一次 drain 按 TTL 重新认领
+ * （`DELIVERING_STALE_MS`，超时即视为"上一个投递者已经死了"）。
+ * 因此：`pending` 计数**不再包含**正在投的那条（窗口极短）；`withdraw_domain_message` 在窗口内
+ * 会回 `not-pending`（不假装撤回）；崩溃恢复由下一次 drain 负责，不靠人。
+ */
+export const INBOX_DELIVERING = 'delivering'
+
+/**
+ * `delivering` 租约的存活上限：**5 分钟**。超过它还没落终态 ⇒ 认定投递者已崩溃（或写终态连续失败），
+ * 下一次 drain 会重新认领并重投。取值理由：一次 agent.followup/inject 是同步入队（毫秒级），
+ * 5 分钟远大于任何正常投递 + 状态写盘时间，又短到不会让消息长期悬着。
+ */
+export const DELIVERING_STALE_MS = 5 * 60 * 1000
 
 /**
  * 跨进程 `.lock` 通道（读-改-写用）。**与 registrations.js:171-238 同一份实现，不复制**：
@@ -157,6 +176,64 @@ export function updateInboxStatus(stateDir, key, id, status, extra) {
     const written = rewriteInbox(stateDir, key, inbox.records)
     if (!written.ok) return { ok: false, reason: 'write-failed', error: written.error, file: inbox.file }
     return { ok: true, file: inbox.file, before, record: next }
+  })
+  if (locked.ok) return locked.value
+  return { ok: false, reason: locked.reason === 'locked' ? 'locked' : 'lock-failed', error: locked.error, file }
+}
+
+/**
+ * 这条记录是不是**别人留下的、已经过期的** `delivering` 租约（＝上一个投递者崩了 / 写终态连续失败）。
+ *
+ * 判据只有一条：`status === 'delivering'` 且 `deliveringAt` 早于 `staleMs`（默认 5 分钟）。
+ * `deliveringAt` 缺失或读不懂 ⇒ 一律当**过期**（宁可重投一次，也不让消息悬着——重复优于丢消息，
+ * 与 drain 既有的 statusWriteFailures 口径一致）。
+ * `status` 不是 delivering ⇒ 永远 false（pending 不是"过期租约"，它是正经的待投）。
+ */
+export function isStaleDelivering(record, nowMs, staleMs) {
+  if (!record || record.status !== INBOX_DELIVERING) return false
+  const at = Date.parse(String(record.deliveringAt ?? ''))
+  if (!Number.isFinite(at)) return true
+  const limit = Number.isFinite(Number(staleMs)) ? Number(staleMs) : DELIVERING_STALE_MS
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now()
+  return now - at >= limit
+}
+
+/**
+ * F-18：**原子认领**一条记录去投递（pending ⇒ delivering），锁内 read-modify-write。
+ *
+ * 这是"谁负责投这一条"的唯一裁决点，等价于一次 CAS：投递前先把它从 `pending` 推到 `delivering`，
+ * 另一路（同进程的第二次 drain、或另一个进程的下一次 drain）再进来时读到 `delivering`/终态就
+ * 回 `{ok:false, reason:'not-pending'}` —— 于是**同一条消息只会被投一次**。
+ *
+ * `expect` 语义（有意写死，不给调用方放宽）：
+ *   · `pending`            ⇒ 认领成功；
+ *   · `delivering` 且过期  ⇒ 认领成功（`reclaimed:true`，接管崩溃遗留的租约）；
+ *   · `delivering` 未过期  ⇒ `not-pending`（别人正在投，别抢）；
+ *   · delivered/failed/withdrawn ⇒ `not-pending`（已有终态，绝不重投）。
+ *
+ * 拿不到锁 ⇒ 如实回 `reason:'locked' | 'lock-failed'`，**绝不绕过锁裸写**（与 updateInboxStatus 同款）。
+ * 永不抛错。
+ */
+export function claimInboxDelivery(stateDir, key, id, options) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const staleMs = Number.isFinite(Number(opts.staleMs)) ? Number(opts.staleMs) : DELIVERING_STALE_MS
+  const by = typeof opts.by === 'string' && opts.by ? opts.by : null
+  const nowMs = Date.now()
+  const file = inboxFileFor(stateDir, key)
+  const locked = withFileLock(file, () => {
+    const inbox = loadInbox(stateDir, key)
+    const index = inbox.records.findIndex((record) => record.id === id)
+    if (index === -1) return { ok: false, reason: 'not-found', file: inbox.file }
+    const before = inbox.records[index]
+    const reclaiming = before.status === INBOX_DELIVERING
+    if (before.status !== INBOX_PENDING && !isStaleDelivering(before, nowMs, staleMs)) {
+      return { ok: false, reason: 'not-pending', status: before.status ?? null, file: inbox.file }
+    }
+    const next = { ...before, status: INBOX_DELIVERING, deliveringAt: new Date(nowMs).toISOString(), deliveringBy: by }
+    inbox.records[index] = next
+    const written = rewriteInbox(stateDir, key, inbox.records)
+    if (!written.ok) return { ok: false, reason: 'write-failed', error: written.error, file: inbox.file }
+    return { ok: true, file: inbox.file, before, record: next, reclaimed: reclaiming }
   })
   if (locked.ok) return locked.value
   return { ok: false, reason: locked.reason === 'locked' ? 'locked' : 'lock-failed', error: locked.error, file }

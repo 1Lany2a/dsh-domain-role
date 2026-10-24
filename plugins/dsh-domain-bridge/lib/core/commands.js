@@ -25,8 +25,9 @@ import {
 import { loadDeclarations } from './declaration.js'
 import { loadDomainStates } from './pause.js'
 import { sessionOf, markRetired, minuteStamp } from './session-factory.js'
-import { stateRoot, webOrigin, isFullSessionId, isSessionIdLike } from './shared.js'
+import { stateRoot, webOrigin, isFullSessionId, isSessionIdLike, messageOf } from './shared.js'
 import { warn } from './tools.js'
+import { buildHandoffCard, handoffTaskText } from './handoff-card.js'
 
 const HANDOFF_DEFAULTS = {
   model: { provider: 'wb', model: 'cn:deepseek-v4.1-flash' },
@@ -326,23 +327,20 @@ function initializeCommand(ctx, deps) {
 /* ----------------------------------------------------------------- /handoff */
 
 /**
- * 交接默认任务文案（v0.8.5 修两处不成立的说法）：
- *   ① `_registry\` 只有**体系根**才有；独立项目根（例如 E:\test）是 `/initialize` 建的骨架，
- *      只有 PROJECT.md / KNOWLEDGE.md / KNOWLEDGE\ / 提案\ / projectlog\ / .gitignore ⇒ 不能一律让人去找交接包；
- *   ② 交接**不写任何文件**（只调 create_domain_session 并写注册册）⇒ 不能写"交接参数由 /handoff 写入"。
+ * 交接默认任务文案（v0.9.x「换届交接瘦身」）。
+ *
+ * 实测口径（不用重新调研）：换届首轮 94~100% 的时间是模型时延，每一步固定 30~40k token 是
+ * 工具 schema；**有「开局只读、先别改文件」禁令的首轮只有 3~11 步，没有禁令的那次 66 步 / 585 秒**。
+ * 所以默认文案改成**固定短模板（≤300 字）**：核身份 → 只读一张 ≤2KB 的交接卡 → 回报三行 →
+ * 本轮不改文件。卡由 `handoff-card.js` 生成（`/handoff` 调用点先生成再把路径填进来）；
+ * 卡生成失败时退回老文案，并在开头如实写失败原因。
+ *
+ * 历史包袱（v0.8.5 修过、仍然有效）：`_registry\` 只有**体系根**才有，独立项目根是
+ * `/initialize` 建的骨架 ⇒ 老文案里那句「这个目录没有体系交接包、不用去找」只属于**回退分支**，
+ * 不再出现在正常路径上（正常路径根本不让人去读那些大文件）。
  */
-export function defaultHandoffTask({ layer, key, cwd }) {
-  const layerWord = layer === 'system' ? '体系主会话' : layer === 'project' ? '项目主会话' : '域会话'
-  const hasPack = Boolean(cwd) && fs.existsSync(path.join(cwd, '_registry', 'handoff.json'))
-  const readLine = hasPack
-    ? '先读 `_registry\\handoff.json`（体系交接包）与 `PROJECT.md` §当前状态，再按 §下一步 开工。'
-    : '先读 `PROJECT.md` §当前状态 与 §下一步 开工（这个目录**没有**体系交接包 `_registry\\handoff.json`，不用去找）。'
-  return (
-    `（换届接任）你接手 **${key}**（${layerWord}）。` +
-    readLine +
-    '本会话的 preset／权限档／模型已在建会话时设置好，不需要你再配；' +
-    '交接**没有**写任何交接文件——在任身份只在注册册（registrations）里，裸跑 `/register` 可核对。'
-  )
+export function defaultHandoffTask(args = {}) {
+  return handoffTaskText(args)
 }
 
 /** 已知的会话 id（在线顶层会话 ∪ 注册册 ∪ 在任声明）——短号解析只在**唯一命中**时接受。 */
@@ -580,7 +578,34 @@ function handoffCommand(ctx, deps) {
       }
       if (!deps.defs || !deps.defs.create) return reply(false, ['create 工具不可用（插件未完整加载），无法新建接班会话。'])
 
-      const task = textOf(param('task')) || defaultHandoffTask({ layer, key, cwd })
+      // ── v0.9.x「换届交接瘦身」：先把**一张 ≤2KB 的交接卡**生成好，再把它的路径填进固定短模板。
+      // 只写 `<stateDir>/handoff/`（不碰 `_registry`、不碰域名册、不碰 projectlog）；生成失败不抛错——
+      // 退回老文案，并在文案开头与回执里如实写"卡为什么没生成"。
+      const previousSessionId = sessionId
+      let handoffCard
+      try {
+        handoffCard = buildHandoffCard({
+          stateDir: deps.config ? deps.config.stateDir : undefined,
+          cwd,
+          key,
+          layer,
+          previousSessionId,
+        })
+      } catch (error) {
+        handoffCard = { ok: false, reason: messageOf(error), path: null, bytes: 0 }
+      }
+      const cardPath = handoffCard && handoffCard.ok === true ? handoffCard.path : null
+      // 显式传 `task=` 时**以用户给的为准**（绝不覆盖）；没给才用短模板。
+      const task =
+        textOf(param('task')) ||
+        defaultHandoffTask({
+          layer,
+          key,
+          cwd,
+          previousSessionId,
+          cardPath,
+          cardError: handoffCard ? handoffCard.reason : null,
+        })
       const created = await deps.defs.create.execute(
         {
           // v0.8.5：**按层建会话**。以前这里把体系/项目键当域塞进 domain 参数、又不传 claim，
@@ -599,6 +624,18 @@ function handoffCommand(ctx, deps) {
         { agent },
       )
       const lines = ['**交接回执**（来自 create_domain_session）', '```json', JSON.stringify(created, null, 2), '```']
+      // v0.9.x：回执里点名这张卡（字节数也报），并把"接任者第一轮只读它"讲清楚——
+      // 否则人以为跟自己有关，其实它只读+回报，不会自己开工。
+      // 交接没建成时卡确实已经写出来了，但**没人读**——照实说，不让一句漂亮话盖住失败。
+      const cardBuilt = handoffCard && handoffCard.ok === true
+      const sessionBuilt = created && created.created === true
+      lines.push(
+        '',
+        cardBuilt
+          ? `· 交接卡：${handoffCard.path}（${handoffCard.bytes} B）——点开后它只读+回报，不会自己开工。` +
+            (sessionBuilt ? '' : '（⚠️ 本次交接没建成会话，这张卡暂时没人读。）')
+          : `· ⚠️ 交接卡没生成（${(handoffCard && handoffCard.reason) || 'unknown'}）⇒ 接任者退回读 PROJECT.md §当前状态/§下一步 各前 3 条。`,
+      )
       const ownerChanged = created && created.claim && created.claim.outcome && created.claim.outcome !== 'conflict'
       lines.push(
         '',

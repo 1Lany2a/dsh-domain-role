@@ -3,6 +3,31 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.11] — 2026-10-24
+
+**交接瘦身（卡＋短模板＋brief）＋ 并发 drain 去重。**
+
+### 一、交接卡与固定短模板（新增）
+
+新增 `lib/core/handoff-card.js`：读 `PROJECT.md` 的 `## 当前状态` / `## 下一步` 各取最前 3 条顶层条目（截断到 ~90 字，超预算再压到 24 字并按字节硬截），加 4 条「第一轮硬规则」，生成 **≤2KB** 的交接卡（实测 1,509 B），落 `<stateDir>/handoff/<flat-key>.md|.json`（不碰 `_registry` / 域名册 / projectlog）。
+
+`/handoff` 默认任务从 549 字符的老文案换成 **219 字固定短模板**（实例化后 343 字符，多出的是卡路径 + 上一任会话 id）：① 裸跑 `/register` 核身份；② **只读这张卡**（明确不读整份 PROJECT.md / changelog / INDEX.md / handoff.json / projectlog）；③ 回报三行；④ **本轮不改任何文件、不开工**。显式 `task=` 仍然优先；卡生成失败（PROJECT.md 缺失 / stateDir 不可写）退回老文案并如实说明。
+
+`create_domain_session` 新增可选参数 `brief`（字符串或对象）：作为交接卡内容落盘，任务自动变短模板 + 卡路径；不传则自动从 PROJECT.md 生成；`dryRun` 只算不写。动机是实测：没有「只读+别开工」禁令的换届首轮 **66 步 / 585s / cacheRead 6.5M**，有禁令的两次只有 **3 / 11 步**。
+
+### 二、并发 drain 重复投递（修，P1）
+
+同一 key 两路 drain 在 `await` 汇合时，agent 会收到两条相同消息。修法两层：进程内 `deliveringIds` 集合（同进程两路并发，`finally` 必释放）+ 落盘 `delivering` **CAS 认领**（`claimInboxDelivery`，锁内：`pending` 或过期 `delivering` → `delivering`）。过期租约（5 分钟）由下一次 drain 接管重投——**重复优于丢消息**；「负责人离线 / 仍被暂停」这种一条都不投的 pass 会把过期租约退回 `pending`。
+
+**契约变化**：INV-05 从「三态」变成「三终态（delivered/failed/withdrawn）＋ 一个中间态 `delivering`」；`pending` 计数不含它、`withdraw` 对它回 `not-pending`。drain 回执新增 `skippedInflight`（聚合有 `skippedInflightCount`），`pendingBefore` 含过期租约，`reason` 新增 `skipped-inflight`。
+
+### 三、验证
+
+- `handoff-card`：卡 1,509 B；短模板固定文案 219 字；假 PROJECT.md 实跑证明 ≤2KB / ≤300 字。
+- drain 去重：探针 33/33 PASS——并发两路 ⇒ agent 收 **1** 条（修前 2 条）、队列 `delivered`、无 `delivering` 残留、一路 `skippedInflight=1`；抛错 ⇒ `failed` 且租约释放；投递中 `inflight=1`、结束 `0`；过期租约接管、新租约不抢、离线退回 `pending`。
+- 队列状态更新（F-02b）复核：真实 `updateInboxStatus`（`withFileLock` 内 load→改→rewrite）两进程 **40/40**、三进程 **40/40**；故意绕过函数（无锁 load+rewrite）能复现 20/40，证明之前的失败是测试绕过了函数。
+- 全套：**8/8 套件、577 用例**（smoke 290/56,931 分支断言、commands 127、menu 51、wizard 37、state 28、bootstrap 16、lifecycle 15、registrations 13/175），真实 state 11 文件 + `domains.json` 前后哈希一致。
+
 ## [0.8.10] — 2026-10-24
 
 **交接面板进应用内（不再开浏览器页）＋ 两处写盘丢数据修掉 ＋ 域名册读不懂时不再放行。**

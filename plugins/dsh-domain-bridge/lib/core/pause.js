@@ -12,7 +12,7 @@ import { warn, tool } from './tools.js'
 // 唯一名 tmp + rename 重试的写盘通道：**复用 registrations.js 的那一份**（勿在本模块另写一套）。
 // 固定名 `<file>.tmp` 在两进程并发写同一状态文件时会静默丢写（审计 P1-02 已复现：期望 120 实际 70）。
 import { writeAtomicUnique } from './registrations.js'
-import { INBOX_PENDING, INBOX_DELIVERED, INBOX_FAILED, INBOX_WITHDRAWN, loadInbox, updateInboxStatus, loadInboxes, domainMessage, deliverToAgent, withFileLock } from './messaging.js'
+import { INBOX_PENDING, INBOX_DELIVERED, INBOX_FAILED, INBOX_WITHDRAWN, INBOX_DELIVERING, DELIVERING_STALE_MS, loadInbox, updateInboxStatus, claimInboxDelivery, isStaleDelivering, loadInboxes, domainMessage, deliverToAgent, withFileLock } from './messaging.js'
 import { loadDeclarations, readDeclarationsForWrite, checkName, projectFromCwd, resolveDomainKeyForState, matchDeclaration, resolveTarget } from './declaration.js'
 import { clipToBytes, liveAgentOf, resolveWakeWiring, resumeSession } from './session-factory.js'
 
@@ -1044,10 +1044,44 @@ export function pausedNoticeOf(config, key, declarations) {
 
 // --------------------------------------------------------------- argument helpers
 
-/** Same name rules as the CLI's assertName. Returns an error string, or null when valid. */
+/**
+ * F-18（2026-10-24）**进程内投递租约**：同一进程里两路 drain 可能拿到**同一份** pending 快照
+ * （目标离线且可唤醒时，两路都在 `resolveWakeWiring` / `resumeSession` 的 `await` 处汇合，醒来后
+ * 各自把同一条投一遍 —— 真机复现：agent 收到 2 条）。这里用模块级 `Set` 记"本进程正在投的 id"：
+ * 后到的那一路直接跳过（记 `skipped-inflight`），**绝不重复投**。
+ *
+ * 三条纪律：
+ *  ① **配对**：`add` 之后无论成功 / 失败 / 抛错，`finally` 里一定 `delete`（绝不泄漏，否则这条消息
+ *     本进程再也投不出去）。
+ *  ② **只管同进程**：跨进程（两个 dsh 实例）的重复投**不在本租约的范围**里；那一层由
+ *     `claimInboxDelivery()` 的落盘 `delivering` 认为兜底（同一份 pending 快照的第二路会读到它）。
+ *  ③ **不会漏投**：集合只在"这一条已经在投"的极短窗口内命中；集合本身不拦任何**后续** drain
+ *     （下一路读到的是终态或过期租约，按正常路径投/重投）。
+ */
+const deliveringIds = new Set()
+
+/** 测试钩子：当前进程内正在投的 id 数（必须恒在投递结束后回到 0）。不要在生产代码里依赖它。 */
+export function __inflightSize() {
+  return deliveringIds.size
+}
+
+/**
+ * 把队列里 pending 的消息按**原 mode** 重投一遍（`set_domain_state(state='active')` 的恢复动作）。
+ *
+ * 并发契约（F-18）：两路 drain 同时对同一条 key 跑 ⇒ **每条消息只投一次**、队列终态 `delivered`、
+ * 不留 `delivering`；后到的那一路在 `skippedInflight` 里如实记账（不假装投成功、也不报错）。
+ */
 export async function drainInbox(ctx, config, key, self) {
   const inbox = loadInbox(config.stateDir, key)
-  const pending = inbox.records.filter((record) => record.status === INBOX_PENDING)
+  const nowMs = Date.now()
+  // 候选＝pending ＋ **过期**的 delivering 租约（上一个投递者崩了/写终态连续失败 ⇒ 这里接管重投）。
+  // 未过期的 delivering 不算候选：另一个投递者正在投它（同进程的另一路，或本进程重启前的自己）。
+  const pending = inbox.records.filter(
+    (record) => record.status === INBOX_PENDING || isStaleDelivering(record, nowMs, DELIVERING_STALE_MS),
+  )
+  const inflightOnDisk = inbox.records.filter(
+    (record) => record.status === INBOX_DELIVERING && !isStaleDelivering(record, nowMs, DELIVERING_STALE_MS),
+  )
   const out = {
     attempted: true,
     // v0.4.2：队列 key 的**目标自身 scope**（域键 ⇒ domain；会话 id ⇒ session）——S5 的入队键口径。
@@ -1063,14 +1097,45 @@ export async function drainInbox(ctx, config, key, self) {
     stillPending: [],
     stillPausedBy: [],
     statusWriteFailures: [],
+    // F-18：本次**没有经我投递**的 id（另一路正在投 / 已被另一路处理 / 认领拿不到锁）。
+    // 每条 `{id, reason, error, status}`；`reason` ∈ inflight | delivering-not-stale | not-pending |
+    // not-found | locked | lock-failed | write-failed。**不是错误**：它们没有被重复投，也没有丢。
+    skippedInflight: inflightOnDisk.map((record) => ({
+      id: record.id,
+      reason: 'delivering-not-stale',
+      error: null,
+      status: INBOX_DELIVERING,
+    })),
     reason: null,
     error: null,
     hint: null,
   }
+  /**
+   * 本次**一条都不投**时（仍被压着 / 负责人离线）把**过期**的 `delivering` 租约退回 `pending`：
+   * 否则崩溃遗留的中间态会一直悬着（`pending` 计数漏掉它、`withdraw` 也碰不到它），
+   * 而它本来就不该在这次 pass 里被投。返回退回的条数（供 hint 如实说明）。
+   */
+  const releaseStaleClaims = () => {
+    let reverted = 0
+    for (const record of pending) {
+      if (!isStaleDelivering(record, nowMs, DELIVERING_STALE_MS)) continue
+      const wrote = updateInboxStatus(config.stateDir, key, record.id, INBOX_PENDING, {
+        deliveringAt: null,
+        deliveringBy: null,
+      })
+      if (wrote.ok) reverted += 1
+      else out.statusWriteFailures.push({ id: record.id, status: INBOX_PENDING, error: wrote.error ?? wrote.reason })
+    }
+    return reverted
+  }
   if (pending.length === 0) {
     out.attempted = false
     out.reason = 'nothing-pending'
-    out.hint = '这个域的队列里没有待投消息，无需重投。'
+    out.hint =
+      '这个域的队列里没有待投消息，无需重投。' +
+      (out.skippedInflight.length
+        ? `（另有 ${out.skippedInflight.length} 条正在投递中——它们由另一个投递者负责，未过 ${Math.round(DELIVERING_STALE_MS / 60000)} 分钟前不会被抢走。）`
+        : '')
     return out
   }
   const declarations = loadDeclarations(config.domainsFile)
@@ -1092,9 +1157,11 @@ export async function drainInbox(ctx, config, key, self) {
       pausedBy: hit.record?.pausedBy ?? null,
     }))
     if (press.unreadable.length) out.unreadableStateFiles = press.unreadable
+    const revertedByPress = releaseStaleClaims()
     out.hint =
       `这 ${pending.length} 条消息**仍被压着，没有投出去**（原样保留 pending）：` +
       `${pausedScopesWords(press.hits)}。` +
+      (revertedByPress ? `其中 ${revertedByPress} 条是上次崩溃遗留的 delivering 租约，已退回 pending。` : '') +
       `要投它们，得把**所有**压着它目标的那几级都解开（解一级不够——判定是 OR 叠加）；` +
       `解开任意一级后再调一次 set_domain_state(state='active')，它会**重新评估**。`
     warn(
@@ -1128,10 +1195,12 @@ export async function drainInbox(ctx, config, key, self) {
   if (!agent) {
     out.reason = 'owner-offline'
     out.stillPending = pending.map((record) => record.id)
+    const revertedByOffline = releaseStaleClaims()
     const wakeReason = out.wake ? out.wake.reason : 'no-owner-declared'
     out.hint =
       `目标会话 ${shortId(ownerSessionId) || ownerSessionId || '（无在任负责人）'} 当前没有活 Agent ⇒ ` +
       `这 ${pending.length} 条消息**原样保留 pending**（没有假装投成功）。` +
+      (revertedByOffline ? `其中 ${revertedByOffline} 条是上次崩溃遗留的 delivering 租约，已退回 pending。` : '') +
       `恢复时**已经试过拉活**（结果=${wakeReason}` +
       `${out.wake && out.wake.error ? '：' + out.wake.error : ''}）⇒ ` +
       (wakeReason === 'no-wake-wiring'
@@ -1143,36 +1212,83 @@ export async function drainInbox(ctx, config, key, self) {
     return out
   }
   for (const record of pending) {
-    const mode = String(record.mode ?? 'followup').toLowerCase()
-    let attempt
-    try {
-      const envelope = String(record.content ?? '')
-      const payload = domainMessage({ self: { id: record.from ?? null, domains: [] }, envelope })
-      attempt = deliverToAgent(agent, mode, payload)
-    } catch (error) {
-      attempt = { ok: false, reason: 'deliver-threw', error: messageOf(error) }
+    const id = record.id
+    // ── F-18：同一进程里另一路 drain 正在投它 ⇒ 直接跳过（**不**重复投，也不报错）。
+    if (deliveringIds.has(id)) {
+      out.skippedInflight.push({ id, reason: 'inflight', error: null, status: INBOX_DELIVERING })
+      continue
     }
-    if (attempt.ok) {
-      const wrote = updateInboxStatus(config.stateDir, key, record.id, INBOX_DELIVERED, {
-        deliveredAt: new Date().toISOString(),
-        deliveredBy: self?.id ?? null,
+    deliveringIds.add(id)
+    try {
+      // ── 落盘认领（pending ⇒ delivering）：锁内 CAS，是"这条归我投"的唯一裁决。
+      // 另一路（同进程的、或跨进程的）读到 delivering/终态就回 not-pending ⇒ 只会有一个投递者。
+      const claimed = claimInboxDelivery(config.stateDir, key, id, {
+        staleMs: DELIVERING_STALE_MS,
+        by: self?.id ?? null,
       })
-      out.delivered.push(record.id)
-      // 消息**确实投出去了**，但状态没写进去 ⇒ 如实记账（下次恢复可能重投一次，重复优于丢消息）。
-      if (!wrote.ok) out.statusWriteFailures.push({ id: record.id, status: INBOX_DELIVERED, error: wrote.error ?? wrote.reason })
-    } else {
-      const wrote = updateInboxStatus(config.stateDir, key, record.id, INBOX_FAILED, {
-        failedReason: attempt.reason,
-        failedAt: new Date().toISOString(),
-      })
-      out.failed.push({ id: record.id, mode, reason: attempt.reason ?? 'unknown' })
-      if (!wrote.ok) out.statusWriteFailures.push({ id: record.id, status: INBOX_FAILED, error: wrote.error ?? wrote.reason })
+      if (!claimed.ok) {
+        out.skippedInflight.push({
+          id,
+          reason: claimed.reason ?? 'unknown',
+          error: claimed.error ?? null,
+          status: claimed.status ?? null,
+        })
+        continue
+      }
+      const mode = String(record.mode ?? 'followup').toLowerCase()
+      let attempt
+      try {
+        const envelope = String(record.content ?? '')
+        const payload = domainMessage({ self: { id: record.from ?? null, domains: [] }, envelope })
+        attempt = deliverToAgent(agent, mode, payload)
+      } catch (error) {
+        attempt = { ok: false, reason: 'deliver-threw', error: messageOf(error) }
+      }
+      if (attempt.ok) {
+        const wrote = updateInboxStatus(config.stateDir, key, id, INBOX_DELIVERED, {
+          deliveredAt: new Date().toISOString(),
+          deliveredBy: self?.id ?? null,
+          // 终态不保留租约字段：队列里"已投递"的记录不该看起来像还在投。
+          deliveringAt: null,
+          deliveringBy: null,
+        })
+        out.delivered.push(id)
+        // 消息**确实投出去了**，但状态没写进去 ⇒ 如实记账（下次恢复可能重投一次，重复优于丢消息）。
+        if (!wrote.ok) out.statusWriteFailures.push({ id, status: INBOX_DELIVERED, error: wrote.error ?? wrote.reason })
+      } else {
+        const wrote = updateInboxStatus(config.stateDir, key, id, INBOX_FAILED, {
+          failedReason: attempt.reason,
+          failedAt: new Date().toISOString(),
+          deliveringAt: null,
+          deliveringBy: null,
+        })
+        out.failed.push({ id, mode, reason: attempt.reason ?? 'unknown' })
+        if (!wrote.ok) out.statusWriteFailures.push({ id, status: INBOX_FAILED, error: wrote.error ?? wrote.reason })
+      }
+    } finally {
+      // 成功 / 失败 / 抛错都释放：漏一次 delete 就等于这条消息在本进程再也投不出去。
+      deliveringIds.delete(id)
     }
   }
-  out.reason = out.failed.length ? (out.delivered.length ? 'partial' : 'all-failed') : 'delivered'
+  out.reason = out.failed.length
+    ? out.delivered.length
+      ? 'partial'
+      : 'all-failed'
+    : out.delivered.length
+      ? 'delivered'
+      : out.skippedInflight.length
+        ? 'skipped-inflight'
+        : 'nothing-pending'
   out.hint = out.failed.length
     ? `恢复了 ${out.delivered.length} 条，${out.failed.length} 条**投递失败**（已标 failed，不会自动重试；原因见 failed）。`
-    : `队列里 ${out.delivered.length} 条 pending 已按原 mode 全部投出去（已标 delivered）。`
+    : out.delivered.length
+      ? `队列里 ${out.delivered.length} 条 pending 已按原 mode 全部投出去（已标 delivered）。`
+      : '本次一条都没有投出去（每一条都被另一个投递者认领走了，见 skippedInflight）——它们不会被重复投。'
+  if (out.skippedInflight.length) {
+    out.hint +=
+      `另有 ${out.skippedInflight.length} 条**未经本次投递**：同时/更早还有一路在投它们（F-18 的进程内租约与` +
+      `队列里的 delivering 认领挡住了重复投），它们要么已被那一路投成 delivered，要么仍在投递窗口中（见 skippedInflight）。`
+  }
   if (out.statusWriteFailures.length) {
     out.hint +=
       `⚠️ 另有 ${out.statusWriteFailures.length} 条**投出去了但状态没写进队列文件**（原因见 statusWriteFailures）⇒` +
@@ -1207,6 +1323,8 @@ export function aggregateDrains({ scope, key, allKeys, selected, skipped, result
   const failed = flat('failed')
   const stillPending = flat('stillPending')
   const statusWriteFailures = flat('statusWriteFailures')
+  // F-18：多队列聚合时把"没经我投、被另一路认领走"的 id 也带上来（不丢信息，也不冒充成功）。
+  const skippedInflight = flat('skippedInflight')
   const stillPausedBy = results.flatMap((item) =>
     (item.stillPausedBy || []).map((hit) => ({ ...hit, queueKey: item.key })),
   )
@@ -1223,10 +1341,12 @@ export function aggregateDrains({ scope, key, allKeys, selected, skipped, result
       failed,
       stillPending,
       statusWriteFailures,
+      skippedInflight,
       stillPausedBy,
       deliveredCount: 0,
       failedCount: 0,
       stillPendingCount: 0,
+      skippedInflightCount: 0,
       wake: null,
       reason: 'nothing-in-scope',
       error: null,
@@ -1260,23 +1380,35 @@ export function aggregateDrains({ scope, key, allKeys, selected, skipped, result
       delivered: item.delivered.length,
       failed: item.failed.length,
       stillPending: item.stillPending.length,
+      skippedInflight: (item.skippedInflight || []).length,
       stillPausedBy: item.stillPausedBy || [],
     })),
     delivered,
     failed,
     stillPending,
     statusWriteFailures,
+    skippedInflight,
     stillPausedBy,
     deliveredCount: delivered.length,
     failedCount: failed.length,
     stillPendingCount: stillPending.length,
+    skippedInflightCount: skippedInflight.length,
     wake: results.find((item) => item.wake)?.wake ?? null,
-    reason: failed.length ? 'partial' : stillPending.length ? 'still-pending' : delivered.length ? 'delivered' : 'nothing-pending',
+    reason: failed.length
+      ? 'partial'
+      : stillPending.length
+        ? 'still-pending'
+        : delivered.length
+          ? 'delivered'
+          : skippedInflight.length
+            ? 'skipped-inflight'
+            : 'nothing-pending',
     error: null,
     hint:
       `恢复 ${scopeWords(scope)}「${key}」：队列目录里 ${allKeys.length} 个队列，选中 ${selected.length} 个 ⇒ ` +
       `**投出 ${delivered.length} 条 / 失败 ${failed.length} 条 / 仍被压着保留 pending ${stillPending.length} 条**` +
       `${pressedWords ? `（压着它们的还是：${pressedWords}）` : ''}` +
+      `${skippedInflight.length ? `；另有 ${skippedInflight.length} 条被另一路投递者认领（见 skippedInflight，未重复投）` : ''}` +
       `${skipped.length ? `；另有 ${skipped.length} 个队列判不出归属（见 skipped，按"不投、不乱投"处理）` : ''}。`,
   }
 }

@@ -13,6 +13,7 @@ import { loadInbox, domainEnvelope, domainMessage } from './messaging.js'
 import { pausedScopesWords, pausedTargetOf, pausedFactsOf, pausedCreateHint } from './pause.js'
 import { loadDeclarations, readOwnersBook, declarationInfo, splitDomainTarget, projectFromCwd, matchDeclaration, labelMatches, declareNewOwner, existingOwnerInfo, domainAlreadyOwnedHint, domainOwnedOverrideHint } from './declaration.js'
 import { readRegistrations, upsertRegistration } from './registrations.js'
+import { buildHandoffCard, cardFromBrief, handoffTaskText } from './handoff-card.js'
 
 export function getSessionController(ctx) {
   try {
@@ -1471,10 +1472,28 @@ export function buildSetDefaultModelTool(ctx) {
   )
 }
 
+/**
+ * `brief` 参数归一化（v0.9.x）：字符串原样用；对象 JSON 化；空串/空对象/不认识的类型 ⇒ `null`（＝没传）。
+ * 只做归一化，不写盘、不抛——卡片的落盘由 handoff-card.js 负责。
+ */
+function briefTextOf(value) {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'string') return value.trim() ? value.trim() : null
+  if (typeof value === 'object') {
+    try {
+      const text = JSON.stringify(value, null, 2)
+      return text && text.trim() && text !== '{}' && text !== '[]' ? text : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
 export function buildCreateSessionTool(ctx, config) {
   return tool(
     'create_domain_session',
-    '**开一个新的顶层会话（域会话）并把一条开工任务排进去**。走宿主服务 `ctx.sessionController.create()`（dsh-api-session-controller/lib/index.js:686-714：**只要给 cwd 就够**；不给 sessionId 时宿主自己生成 `session-<uuid>`）。v0.3.2 起让这条会话**抬眼可见**：① 先按 cwd 在宿主 Workspace 注册表里找一个**已存在**的工作区（`resolveByPath`，纯读、**绝不新建分组**），命中就传 `{workspaceId}`（宿主会把它挂进那个分组），未命中或拿不到注册表就退回 v0.3.1 的 `{cwd}`；② 建完再 `pinSession(sessionId)` 把它**置顶**到它所属分组最上方。找不到的排障顺序：那个分组若**折叠**就先点组名展开（折叠组一行都不渲染），再不行用左侧栏**搜索框输 cwd 的目录名**，或把排序方式切成「最近更新」。**本工具仍不能把它翻到前台**——宿主侧根本没有 Host→Renderer 导航通道，只能由人点一下那一条（或由渲染层客户端插件代点）。**v0.3.3 起建完还会顺手做两件事**（都能单独关掉，失败只影响那一步、不影响 `created`）：① 把沙箱/审批档设成 `permissionPreset`（不给＝用配置 `domainSessionPreset`，缺省 `workspace-write`——后台域会话无人值守不该卡在「等人点同意」，但要全盘写权限必须自己显式配 `danger-full-access`）；② 把标题设成 `title`（不给＝自动生成「[域] 2026-10-12 23:30 · 任务首句」，时间戳前置、≤80 字节；命名会 pin 标题、之后不再有 LLM 自动标题，对域会话无损失——它的首条消息是插件投递的，本来就不触发自动命名）。参数：`domain`（必填，`asr` 或 `项目:域`）、`task`（必填，要排给新会话的纯文本任务）、`project?`（短名 domain 时补项目；缺省用本会话 cwd 的目录名小写）、`cwd?`（新会话的工作目录；缺省用调用方会话的 cwd；相对路径会被宿主进程按自身 cwd 解析，建议给绝对路径）、`claim?`（默认 false；true = 建完把该域的「在任声明」指向新会话；**该域已有别的负责人时不覆盖**，如实回报冲突并给出换人办法）、`allowExistingOwner?`（默认 false；**v0.3.6 起：无论 claim 与否，本工具都会先读域名册**，回执常带 `existingOwner`（谁在任 / 是否在线 / 是否还在会话索引里）。该域**已有负责人**、你又没传 `claim:true`、也没传 `allowExistingOwner:true` ⇒ **不建会话**，回 `{created:false, reason=domain-already-owned, existingOwner, hint}`——这是为了防止同一个域起两条活会话并发改同一批文档（2026-10-12 docs 域事故）；传 `true` ＝ 明知已有负责人仍要再开一条，回执会带 `warning=domain-already-owned`，风险自负）、`pin?`（默认 **true**；`false` = 跳过置顶）、`permissionPreset?`（可选：建完立刻给这个会话设的权限档名，`read-only`／`workspace-write`／`danger-full-access`；`none`/`keep`/`skip`/空 ＝ 不动）、`title?`（可选：标题原文；`none`/`keep`/`skip`/空 ＝ 不命名）、`dryRun?`（默认 false；true 只回报"将会建哪个 cwd 的会话、排什么任务"、将设什么标题与权限档，**绝不真建**）、`agentPreset?`（可选，逐字透传给宿主的 `agentPreset`）。**v0.6.0 模型分派**：`model?`（`{provider, model, reasoningEffort?}`）＝建完立刻给新会话铺的模型（宿主 `create` 不收模型参数 ⇒ 建完调 `selectModel`）；不给＝用配置 `domainSessionModel`；都没有＝继承全局默认（保持旧行为）。铺模型同样是「先记全局默认 → 改 → 恢复」，回执带 `modelApplied:{ok, provider, model, source, error?}`；建会话本身失败时**一个模型都不改**。任何一步失败都**不抛错**，一律回报 `{created:false, reason}`。****v0.4.0 起「已暂停」｜v0.4.2 推广到四级**：目标被**任一级**按下（`scope` 取 `domain` / `session`（主＝单会话）/ `project` / `global`，**OR 叠加**）时**直接拒绝**：`created:false` / `reason=domain-paused`（冻结的历史字面量）/ `pausedScopes` / `pausedByScopes` / `scope` / `derivedState`，并且**绝不调用宿主 create**（`dryRun` 也一样，只报告"会被拒绝"）——暂停期间不新开、也不唤醒，这正是"暂停"的意义。判定**两端都查**：接收端（将新建的那个域键 / 它的项目 / 它的负责人会话 / global）＋发送端（本会话 / 本会话的项目 / global）。恢复后再建：`set_domain_state(scope=…, domain=…, state=active)`。暂停**不改在任身份**（声明册里 sessionId 不动），它与下面 F1 的「已有负责人」是两条**独立**的闸，本工具**先判暂停、再判负责人**。',
+    '**开一个新的顶层会话（域会话）并把一条开工任务排进去**。走宿主服务 `ctx.sessionController.create()`（dsh-api-session-controller/lib/index.js:686-714：**只要给 cwd 就够**；不给 sessionId 时宿主自己生成 `session-<uuid>`）。v0.3.2 起让这条会话**抬眼可见**：① 先按 cwd 在宿主 Workspace 注册表里找一个**已存在**的工作区（`resolveByPath`，纯读、**绝不新建分组**），命中就传 `{workspaceId}`（宿主会把它挂进那个分组），未命中或拿不到注册表就退回 v0.3.1 的 `{cwd}`；② 建完再 `pinSession(sessionId)` 把它**置顶**到它所属分组最上方。找不到的排障顺序：那个分组若**折叠**就先点组名展开（折叠组一行都不渲染），再不行用左侧栏**搜索框输 cwd 的目录名**，或把排序方式切成「最近更新」。**本工具仍不能把它翻到前台**——宿主侧根本没有 Host→Renderer 导航通道，只能由人点一下那一条（或由渲染层客户端插件代点）。**v0.3.3 起建完还会顺手做两件事**（都能单独关掉，失败只影响那一步、不影响 `created`）：① 把沙箱/审批档设成 `permissionPreset`（不给＝用配置 `domainSessionPreset`，缺省 `workspace-write`——后台域会话无人值守不该卡在「等人点同意」，但要全盘写权限必须自己显式配 `danger-full-access`）；② 把标题设成 `title`（不给＝自动生成「[域] 2026-10-12 23:30 · 任务首句」，时间戳前置、≤80 字节；命名会 pin 标题、之后不再有 LLM 自动标题，对域会话无损失——它的首条消息是插件投递的，本来就不触发自动命名）。参数：`domain`（必填，`asr` 或 `项目:域`）、`task`（必填，要排给新会话的纯文本任务）、`brief?`（可选，**交接卡内容**：字符串或对象，≤2KB，落盘到 `<stateDir>/handoff/`；给了它、又没给 `task` ⇒ 任务自动变成固定短模板「核身份 → 只读这张卡 → 回报三行 → 本轮不改文件」；不给则自动从 PROJECT.md 的 §当前状态/§下一步 各前 3 条生成）、`project?`（短名 domain 时补项目；缺省用本会话 cwd 的目录名小写）、`cwd?`（新会话的工作目录；缺省用调用方会话的 cwd；相对路径会被宿主进程按自身 cwd 解析，建议给绝对路径）、`claim?`（默认 false；true = 建完把该域的「在任声明」指向新会话；**该域已有别的负责人时不覆盖**，如实回报冲突并给出换人办法）、`allowExistingOwner?`（默认 false；**v0.3.6 起：无论 claim 与否，本工具都会先读域名册**，回执常带 `existingOwner`（谁在任 / 是否在线 / 是否还在会话索引里）。该域**已有负责人**、你又没传 `claim:true`、也没传 `allowExistingOwner:true` ⇒ **不建会话**，回 `{created:false, reason=domain-already-owned, existingOwner, hint}`——这是为了防止同一个域起两条活会话并发改同一批文档（2026-10-12 docs 域事故）；传 `true` ＝ 明知已有负责人仍要再开一条，回执会带 `warning=domain-already-owned`，风险自负）、`pin?`（默认 **true**；`false` = 跳过置顶）、`permissionPreset?`（可选：建完立刻给这个会话设的权限档名，`read-only`／`workspace-write`／`danger-full-access`；`none`/`keep`/`skip`/空 ＝ 不动）、`title?`（可选：标题原文；`none`/`keep`/`skip`/空 ＝ 不命名）、`dryRun?`（默认 false；true 只回报"将会建哪个 cwd 的会话、排什么任务"、将设什么标题与权限档，**绝不真建**）、`agentPreset?`（可选，逐字透传给宿主的 `agentPreset`）。**v0.6.0 模型分派**：`model?`（`{provider, model, reasoningEffort?}`）＝建完立刻给新会话铺的模型（宿主 `create` 不收模型参数 ⇒ 建完调 `selectModel`）；不给＝用配置 `domainSessionModel`；都没有＝继承全局默认（保持旧行为）。铺模型同样是「先记全局默认 → 改 → 恢复」，回执带 `modelApplied:{ok, provider, model, source, error?}`；建会话本身失败时**一个模型都不改**。任何一步失败都**不抛错**，一律回报 `{created:false, reason}`。****v0.4.0 起「已暂停」｜v0.4.2 推广到四级**：目标被**任一级**按下（`scope` 取 `domain` / `session`（主＝单会话）/ `project` / `global`，**OR 叠加**）时**直接拒绝**：`created:false` / `reason=domain-paused`（冻结的历史字面量）/ `pausedScopes` / `pausedByScopes` / `scope` / `derivedState`，并且**绝不调用宿主 create**（`dryRun` 也一样，只报告"会被拒绝"）——暂停期间不新开、也不唤醒，这正是"暂停"的意义。判定**两端都查**：接收端（将新建的那个域键 / 它的项目 / 它的负责人会话 / global）＋发送端（本会话 / 本会话的项目 / global）。恢复后再建：`set_domain_state(scope=…, domain=…, state=active)`。暂停**不改在任身份**（声明册里 sessionId 不动），它与下面 F1 的「已有负责人」是两条**独立**的闸，本工具**先判暂停、再判负责人**。',
     {
       layer: {
         type: 'string',
@@ -1484,7 +1503,15 @@ export function buildCreateSessionTool(ctx, config) {
           '不传＝`domain`，行为与以前逐字一致。',
       },
       domain: { type: 'string', description: '域短名（asr）或「项目:域」（misas:asr）。layer=system 时用「项目:system」，layer=project 时用「项目:main」（都给短名也行，按层规整）。' },
-      task: { type: 'string', description: '要排给新会话的纯文本开工任务（以完整 v4 用户消息排进它的 inbox 并唤醒它开一轮）。v0.8.4 起插件会在它前面自动加一句**身份摘要**（「你是 `<项目>:<域>` 的负责人」或「你要接手它、当前在任 X」），原文一字不改跟在分隔线之后——新会话第一轮就知道自己是谁，不必先点 `/register`。' },
+      task: { type: 'string', description: '要排给新会话的纯文本开工任务（以完整 v4 用户消息排进它的 inbox 并唤醒它开一轮）。v0.8.4 起插件会在它前面自动加一句**身份摘要**（「你是 `<项目>:<域>` 的负责人」或「你要接手它、当前在任 X」），原文一字不改跟在分隔线之后——新会话第一轮就知道自己是谁，不必先点 `/register`。**显式传 task 时以你给的为准**（`brief` 只负责把卡落盘，绝不覆盖它）。' },
+      brief: {
+        description:
+          '可选（v0.9.x「换届交接瘦身」）：**交接卡内容**——这是接任者**第一轮唯一需要读的材料**，≤2KB。' +
+          '给字符串就原样落盘；给对象就 JSON 化后落盘（超 2KB 按字节截断）。落盘到 `<stateDir>/handoff/<项目-域>.md`（同时写一份同名 .json 机器读版本）。' +
+          '**传了 brief 又没传 task** ⇒ 开工任务自动变成固定短模板（≤300 字）：「核身份 → 只读这张卡 → 回报三行 → 本轮不改文件」；传了 task 则 task 优先，brief 只落盘。' +
+          '**不传 brief 也不传 task** ⇒ 自动从 cwd 的 `PROJECT.md`（§当前状态 / §下一步 各前 3 条）生成卡并套用同一份短模板；`PROJECT.md` 读不到时才回 `missing-task`。' +
+          '卡片只写 `<stateDir>/handoff/`，不写 `_registry`、不写域名册；生成失败会如实回报并把任务退回老文案。',
+      },
       model: {
         type: 'object',
         properties: {
@@ -1513,8 +1540,22 @@ export function buildCreateSessionTool(ctx, config) {
           return { created: false, reason: 'missing-domain', hint: 'domain 必填：短名（asr）或「项目:域」（misas:asr）。', self }
         }
         const task = String(args.task ?? '')
-        if (!task.trim()) {
-          return { created: false, reason: 'missing-task', hint: 'task 必填：要排给新会话的纯文本任务。', self }
+        // ── v0.9.x「换届交接瘦身」：`task` 仍然必填（建一条没有任务的空会话没有意义），但
+        // `brief`（＝卡内容）或一份**可读的 PROJECT.md** 也能顶替它——两者都没有时才报
+        // `missing-task`（老行为逐字不变，回执 reason 也没换名字）。
+        const briefText = briefTextOf(args.brief)
+        const earlyCwd = String(args.cwd ?? self.cwd ?? '').trim()
+        const earlyProjectFile = earlyCwd ? path.join(earlyCwd, 'PROJECT.md') : ''
+        const canAutoCard = Boolean(earlyProjectFile) && fs.existsSync(earlyProjectFile)
+        if (!task.trim() && briefText === null && !canAutoCard) {
+          return {
+            created: false,
+            reason: 'missing-task',
+            hint:
+              'task 必填：要排给新会话的纯文本任务。' +
+              '（也可以传 `brief`＝交接卡内容，或让 cwd 里有一份可读的 `PROJECT.md`——插件会据此自动生成卡并套用短模板。）',
+            self,
+          }
         }
 
         // ── v0.6.0: which model should the NEW session get? explicit `model` wins, then the
@@ -1743,9 +1784,64 @@ export function buildCreateSessionTool(ctx, config) {
             : existingOwner && existingOwner.sessionId
               ? `你要接手的是 \`${key}\`；该域当前在任 ${existingOwner.sessionId}，本次**没有**认领它。先裸跑 \`/register\` 核对身份，要正式接任就 \`/register domain ${key} takeover\`。`
               : `你被指派到 \`${key}\`。本次**没有**认领它的在任声明；先裸跑 \`/register\` 看身份，要接任就 \`/register domain ${key}\`。`
+        // ── v0.9.x「换届交接瘦身」：开工任务配一张 ≤2KB 的交接卡（接任者第一轮**只读它**）。
+        // 三条来路：① 显式 `brief` ⇒ 用它当卡内容；② 既没 task 也没 brief ⇒ 从 PROJECT.md 自动生成；
+        // ③ 显式 `task` ⇒ **不生成、不覆盖**（调用方自己控制文案，例如 /handoff 已经生成过卡）。
+        // dryRun 只算不写（演练承诺"不产生副作用"），但任务文本是真实的——路径就是真落盘的那个。
+        const cardWrite = args.dryRun !== true
+        let handoffCard = null
+        if (briefText !== null) {
+          handoffCard = cardFromBrief({
+            brief: briefText,
+            cwd,
+            key,
+            layer,
+            previousSessionId: replyKey,
+            stateDir: config.stateDir,
+            write: cardWrite,
+          })
+        } else if (!task.trim()) {
+          handoffCard = buildHandoffCard({
+            cwd,
+            key,
+            layer,
+            previousSessionId: replyKey,
+            stateDir: config.stateDir,
+            write: cardWrite,
+          })
+        }
+        let taskText = task
+        if (!taskText.trim()) {
+          taskText = handoffTaskText({
+            layer,
+            key,
+            cwd,
+            previousSessionId: replyKey,
+            cardPath: handoffCard && handoffCard.ok === true ? handoffCard.path : null,
+            cardError: handoffCard ? handoffCard.reason : 'not-generated',
+          })
+        }
+        // 回执里报告的那一份（与 tasks 无关的排障信息：路径、字节数、来路、真写了没）。
+        const handoffCardReport = handoffCard
+          ? handoffCard.ok === true
+            ? {
+                ok: true,
+                path: String(handoffCard.path ?? ''),
+                jsonPath: String(handoffCard.jsonPath ?? ''),
+                bytes: Number(handoffCard.bytes ?? 0),
+                source: briefText !== null ? 'brief' : 'project-md',
+                written: handoffCard.written === true,
+              }
+            : {
+                ok: false,
+                reason: String(handoffCard.reason || 'unknown'),
+                source: briefText !== null ? 'brief' : 'project-md',
+                written: false,
+              }
+          : null
         const envelope = domainEnvelope({
           self,
-          text: `${identityHeader}\n\n---\n\n${task}`,
+          text: `${identityHeader}\n\n---\n\n${taskText}`,
           replyKey,
           mode: 'followup',
           label: isMainLayer ? `${layerWordOf(layer)}交接任务` : '域会话开工任务',
@@ -1794,8 +1890,8 @@ export function buildCreateSessionTool(ctx, config) {
           args.title === undefined || args.title === null
             ? isMainLayer
               // 主会话层的默认标题不写「[system]」——那是域的形状，侧栏里看不出它是体系主/项目主。
-              ? mainLayerTitle(layer, task, new Date())
-              : domainSessionTitle(split.domain, task, new Date())
+              ? mainLayerTitle(layer, taskText, new Date())
+              : domainSessionTitle(split.domain, taskText, new Date())
             : offSwitch(args.title)
               ? null
               : clipToBytes(args.title, TITLE_MAX_BYTES)
@@ -1835,6 +1931,8 @@ export function buildCreateSessionTool(ctx, config) {
               reasoningEffort: modelWanted?.reasoningEffort ?? null,
             },
             wouldTitle: { requested: titleWanted !== null, title: titleWanted },
+            // v0.9.x：演练里卡是"只算不写"（written:false），但路径/字节数都是真的。
+            ...(handoffCardReport ? { handoffCard: handoffCardReport } : {}),
             self,
             note: '演练：没有建会话、没有排任务、没有动域名册。',
           }
@@ -2084,6 +2182,12 @@ export function buildCreateSessionTool(ctx, config) {
         const taskLine = scheduled.ok
           ? `开工任务已排进去（将被唤醒开始干活）；它回话用 send_to_domain，target=${replyKey}。`
           : `但开工任务没排进去（见 scheduled.reason）。`
+        // v0.9.x：卡的情况必须说清楚——人要知道"接任者第一轮只会读那一个文件"。
+        const cardLine = !handoffCardReport
+          ? ''
+          : handoffCardReport.ok
+            ? `交接卡：${handoffCardReport.path}（${handoffCardReport.bytes} B，来源=${handoffCardReport.source}${handoffCardReport.written ? '' : '，演练未落盘'}）——它第一轮只读这张卡+回报，不会自己开工。`
+            : `⚠️ 交接卡没生成（${handoffCardReport.reason}，来源=${handoffCardReport.source}）⇒ 开工任务退回老文案（读 PROJECT.md §当前状态/§下一步 各前 3 条）。`
         const groupLine = workspaceTitle === null ? '未分组' : workspaceTitle
         const workspaceLine =
           workspaceInfo.attached === true
@@ -2137,6 +2241,9 @@ export function buildCreateSessionTool(ctx, config) {
           titled,
           ...(modelApplied ? { modelApplied } : {}),
           scheduled,
+          // v0.9.x：这张卡就是接任者第一轮唯一要读的材料（≤2KB）。没有卡时这里是 null，
+          // 由 hint 说明为什么没生成——不假装成功。
+          ...(handoffCardReport ? { handoffCard: handoffCardReport } : {}),
           // v0.8.4：随开工任务一起发出去的身份摘要（原文 task 在它之后，一字未改）。
           taskIdentity: identityHeader,
           claim,
@@ -2149,6 +2256,7 @@ export function buildCreateSessionTool(ctx, config) {
             permissionLine +
             titledLine +
             modelLine +
+            cardLine +
             (overrideWarning ? domainOwnedOverrideHint(key, existingOwner) : '') +
             `请到左侧会话列表点开 ${short} 那一条（本工具不会把它翻到前台：宿主侧没有 Host→Renderer 导航通道，只能人点一下，或由渲染层客户端插件代点）。` +
             taskLine,

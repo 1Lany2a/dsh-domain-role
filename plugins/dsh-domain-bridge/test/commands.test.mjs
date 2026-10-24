@@ -4,8 +4,15 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildCommandDefs } from '../lib/core/commands.js'
+import { buildCommandDefs, defaultHandoffTask } from '../lib/core/commands.js'
 import { upsertRegistration, readRegistrations } from '../lib/core/registrations.js'
+import {
+  buildHandoffCard,
+  cardFromBrief,
+  handoffTaskText,
+  HANDOFF_CARD_RULES,
+  HANDOFF_CARD_MAX_BYTES,
+} from '../lib/core/handoff-card.js'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cmd-'))
 const domainsFile = path.join(root, 'domains.json')
@@ -213,14 +220,145 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(calls.length === 0, '裸跑 /resume 不能触发任何写操作')
 }
 
-// 18. /handoff 默认任务文案：不能假设有体系交接包，也不能说"交接参数由 /handoff 写入"
+// 18. /handoff 默认任务：**没有** PROJECT.md 时退回老文案，并在开头如实写清卡为什么没生成
 {
   calls.length = 0
   await run('handoff', '')
   const args = calls.find((c) => c[0] === 'create')?.[1]
-  caseOk(!args.task.includes('交接参数由 /handoff 写入'), '不能再说"交接参数由 /handoff 写入"（它不写任何文件）')
-  caseOk(args.task.includes('_registry\\handoff.json') && args.task.includes('不用去找'), '这个 cwd 没有交接包时应明确说不用去找')
-  caseOk(args.task.includes('注册册'), '应说明在任身份只在注册册里')
+  caseOk(
+    args.task.startsWith('（交接卡生成失败：project-file-missing'),
+    '没有 PROJECT.md 时必须在开头如实写"卡生成失败"的原因',
+  )
+  caseOk(args.task.includes('不用去找'), '回退文案仍要说明这个目录没有体系交接包（不用去找）')
+  caseOk(args.task.includes('注册册'), '回退文案应说明在任身份只在注册册里')
+  caseOk(!args.task.includes('交接参数由 /handoff 写入'), '不能再说"交接参数由 /handoff 写入"')
+}
+
+// 18.1 交接卡：只取 §当前状态 / §下一步 各前 3 条顶层条目，整卡 ≤2048 B，含 4 条第一轮硬规则
+{
+  const md = [
+    '# PROJECT.md — 测试用',
+    '',
+    '## 当前状态',
+    '',
+    '- 状态一：已把换届按层拆开。',
+    '- 状态二：首轮耗时几乎全是模型时延。',
+    '- 状态三：这第三条不该被截掉。',
+    '- 状态四：第四条必须被丢掉（只取前 3 条）。',
+    '  - 缩进子项：不属于顶层条目，卡片里不该单独出现。',
+    '',
+    '## 下一步',
+    '',
+    '1. 下一步一：移植卡生成器。',
+    '2. 下一步二：加 brief 参数。',
+    '3. 下一步三：跑隔离 8 套。',
+    '',
+    '## 别的节',
+    '',
+    '- 别的节里的这一条不该出现在卡片上。',
+    '',
+  ].join('\n')
+  fs.writeFileSync(path.join(cwd, 'PROJECT.md'), md, 'utf8')
+  const card = buildHandoffCard({ stateDir, cwd, key: 'tixiweihu:system', layer: 'system', previousSessionId: 'session-test' })
+  caseOk(card.ok === true, `有 PROJECT.md 时应生成交接卡（${card.reason || ''}）`)
+  caseOk(card.bytes === Buffer.byteLength(card.markdown, 'utf8'), '回报的字节数必须等于卡的实际 UTF-8 字节数')
+  caseOk(card.bytes <= HANDOFF_CARD_MAX_BYTES, `整卡必须 ≤${HANDOFF_CARD_MAX_BYTES} B（实际 ${card.bytes}）`)
+  caseOk(card.status.length === 3 && card.next.length === 3, '§当前状态/§下一步 应各取 3 条')
+  caseOk(card.markdown.includes('状态三') && !card.markdown.includes('状态四'), '只取前 3 条：第 4 条不得进卡')
+  caseOk(!card.markdown.includes('缩进子项'), '缩进子项不算顶层条目')
+  caseOk(!card.markdown.includes('别的节里的这一条'), '别的节的条目不得进卡')
+  caseOk(HANDOFF_CARD_RULES.every((rule) => card.markdown.includes(rule)), '4 条第一轮硬规则必须全部在卡上')
+  caseOk(card.markdown.includes('session-test') && card.markdown.includes('tixiweihu:system'), '卡上要有在任键与上一任会话 id')
+  caseOk(fs.existsSync(card.path) && fs.existsSync(card.jsonPath), '卡的 .md 与 .json 都必须真的落盘')
+  caseOk(
+    path.dirname(card.path) === path.join(stateDir, 'handoff'),
+    '卡只许写在 <stateDir>/handoff/（不碰 _registry、不碰域名册）',
+  )
+  const cardJson = JSON.parse(fs.readFileSync(card.jsonPath, 'utf8'))
+  caseOk(cardJson.schema === 'dsh-domain-bridge/handoff-card@1' && cardJson.status.length === 3, '机器读那份要能被解析且带同一份事实')
+  caseOk(!card.markdown.includes('_registry'), '卡片里不该出现 _registry（它没写那里）')
+}
+
+// 18.2 超长条目也不能超预算（按字节往下压，中文 1 字≈3 字节）
+{
+  const longDir = path.join(root, 'longcard')
+  fs.mkdirSync(longDir, { recursive: true })
+  const item = '这一条特别长'.repeat(40)
+  fs.writeFileSync(
+    path.join(longDir, 'PROJECT.md'),
+    `## 当前状态\n\n- ${item}\n- ${item}\n- ${item}\n\n## 下一步\n\n- ${item}\n- ${item}\n- ${item}\n`,
+    'utf8',
+  )
+  const card = buildHandoffCard({ stateDir, cwd: longDir, key: 'other:long8k', layer: 'domain', previousSessionId: 'session-x' })
+  caseOk(card.ok === true && card.bytes <= HANDOFF_CARD_MAX_BYTES, `超长条目也必须压到 ≤2048 B（实际 ${card.bytes}）`)
+  caseOk(HANDOFF_CARD_RULES.every((rule) => card.markdown.includes(rule)), '压短条目时不得把硬规则挤掉')
+}
+
+// 18.3 PROJECT.md 缺失 / 不可读 / 没有那两节：都不许抛，都要如实回报
+{
+  const emptyDir = path.join(root, 'noproject')
+  fs.mkdirSync(emptyDir, { recursive: true })
+  const missing = buildHandoffCard({ stateDir, cwd: emptyDir, key: 'x:none', layer: 'domain' })
+  caseOk(missing.ok === false && missing.reason === 'project-file-missing', '缺 PROJECT.md 应返回 project-file-missing（不抛）')
+  caseOk(missing.markdown === '' && missing.path === null, '缺文件时不给假路径')
+
+  const oddDir = path.join(root, 'oddshape')
+  fs.mkdirSync(oddDir, { recursive: true })
+  fs.writeFileSync(path.join(oddDir, 'PROJECT.md'), '# 只有标题，没有那两节\n', 'utf8')
+  const odd = buildHandoffCard({ stateDir, cwd: oddDir, key: 'x:odd', layer: 'domain' })
+  caseOk(odd.ok === true, '结构变了也要出一张卡（身份 + 规则仍在），不能因此失败')
+  caseOk(odd.sectionsMissing.length === 2, '拿不到那两节时应如实报 sectionsMissing')
+
+  const noCwd = buildHandoffCard({ stateDir, key: 'x:nocwd', layer: 'domain' })
+  caseOk(noCwd.ok === false && noCwd.reason === 'cwd-unknown', '既没 cwd 也没 projectFile 时应返回 cwd-unknown')
+
+  const briefCard = cardFromBrief({ brief: 'x'.repeat(5000), stateDir, key: 'x:brief', layer: 'domain' })
+  caseOk(briefCard.ok === true && briefCard.bytes <= HANDOFF_CARD_MAX_BYTES, 'brief 超预算时要按字节截断到 ≤2048 B')
+  caseOk(cardFromBrief({ brief: '   ', stateDir, key: 'x:emptybrief' }).reason === 'brief-empty', '空 brief 应被拒')
+}
+
+// 18.4 短模板：有卡就只做四件事；模板固定文案 ≤300 字（实例化后多出来的只是路径与会话 id）
+{
+  const withCard = handoffTaskText({
+    layer: 'system',
+    key: 'tixiweihu:system',
+    cardPath: path.join(stateDir, 'handoff', 'tixiweihu-system.md'),
+    previousSessionId: 'session-test',
+  })
+  caseOk(withCard.includes('本轮只做四件事'), '短模板必须限定"本轮只做四件事"')
+  caseOk(withCard.includes('只读这张交接卡'), '短模板必须点名只读那张卡')
+  caseOk(withCard.includes('PROJECT.md/changelog/INDEX.md/handoff.json/projectlog'), '短模板必须点名不要读那几份大文件')
+  caseOk(withCard.includes('target=session-test'), '短模板必须给出回报目标（上一任会话 id）')
+  caseOk(withCard.includes('本轮不改任何文件、不开工'), '短模板必须写明本轮不改文件')
+  caseOk(!withCard.includes('注册册'), '短模板不再让人去翻注册册（核身份只要裸跑 /register）')
+  // 固定文案 = 去掉卡路径与会话 id 这两个必须给全的标识符之后的部分
+  const prose = withCard.split(path.join(stateDir, 'handoff', 'tixiweihu-system.md')).join('').split('session-test').join('')
+  caseOk([...prose].length <= 300, `固定文案必须 ≤300 字（实际 ${[...prose].length} 字）`)
+  const fallback = defaultHandoffTask({ layer: 'project', key: 'p:main', cwd, cardError: 'project-file-missing' })
+  caseOk(fallback.startsWith('（交接卡生成失败：project-file-missing'), '没卡时 defaultHandoffTask 要退回老文案并说明原因')
+}
+
+// 18.5 /handoff 默认走卡：任务里带卡的绝对路径，回执点名卡与字节数
+{
+  calls.length = 0
+  const out = await run('handoff', '')
+  const args = calls.find((c) => c[0] === 'create')?.[1]
+  const expectedPath = path.join(stateDir, 'handoff', 'tixiweihu-system.md')
+  caseOk(args.task.includes(expectedPath), '默认任务必须把卡的绝对路径填进去')
+  caseOk(args.task.includes('本轮只做四件事') && !args.task.includes('交接卡生成失败'), '默认任务应是短模板（不是回退文案）')
+  caseOk(out.text.includes(`交接卡：${expectedPath}`), `回执必须带一行 交接卡：<path>（实际回执片段：${out.text.slice(0, 80)}…）`)
+  caseOk(/（\d+ B）/.test(out.text), '回执必须带卡的字节数')
+  caseOk(out.text.includes('只读+回报，不会自己开工'), '回执必须说明点开后它只读+回报、不会自己开工')
+  caseOk(fs.existsSync(expectedPath), '回执里给的卡路径必须真的存在')
+}
+
+// 18.6 显式 task= 时以用户给的为准（卡照生成，但绝不覆盖任务文本）
+{
+  calls.length = 0
+  const out = await run('handoff', 'task=我自己写的开工任务')
+  const args = calls.find((c) => c[0] === 'create')?.[1]
+  caseOk(args.task === '我自己写的开工任务', `显式 task 必须原样使用（实际：${args.task}）`)
+  caseOk(out.text.includes('交接卡：'), '即使显式 task，回执也要报卡（卡是给接任者读的材料）')
 }
 
 // 19. /handoff retire=now：建成功后当场退役（复用 /retire 同一份实现）

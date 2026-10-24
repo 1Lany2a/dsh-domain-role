@@ -944,6 +944,150 @@ const createExec = { agent: sender }
   eq(out.created, false, '意外错误应 created:false')
 }
 
+// ------------------------- 6.5 v0.9.x 交接卡 / brief（「换届交接瘦身」的宿主侧那一半）
+
+/** 一张小 PROJECT.md：只该取 §当前状态/§下一步 各前 3 条，缩进子项与别的节都不许进卡。 */
+const cardCwd = path.join(root, 'card-project')
+fs.mkdirSync(cardCwd, { recursive: true })
+fs.writeFileSync(
+  path.join(cardCwd, 'PROJECT.md'),
+  [
+    '# PROJECT.md（测试用）',
+    '',
+    '## 当前状态',
+    '',
+    '- 状态一：换届按层拆开。',
+    '- 状态二：首轮耗时几乎全是模型时延。',
+    '- 状态三：这一条要保留。',
+    '- 状态四：这一条必须被丢掉。',
+    '  - 缩进子项：不是顶层条目。',
+    '',
+    '## 下一步',
+    '',
+    '1. 下一步一：移植卡生成器。',
+    '2. 下一步二：加 brief 参数。',
+    '3. 下一步三：跑隔离 8 套。',
+    '',
+    '## 别的节',
+    '',
+    '- 别的节的条目不许进卡。',
+    '',
+  ].join('\n'),
+  'utf8',
+)
+const cardSender = makeAgent(ID.S, { cwd: cardCwd })
+
+{
+  // brief（字符串）⇒ 落盘成卡 + 任务自动变短模板（只读这张卡 / 回报三行 / 本轮不改文件）。
+  const created = makeAgent(ID.C, { cwd: cardCwd })
+  const controller = { create: async () => ({ sessionId: ID.C }) }
+  const stateDir = path.join(root, 'state-card-brief')
+  const out = await call(
+    mount({ controller, get: () => created, stateDir }),
+    'create_domain_session',
+    { domain: 'asr', brief: '# 交接卡（brief）\n\n- 只读这一张\n' },
+    { agent: cardSender },
+    'create/brief-string',
+  )
+  eq(out.created, true, '带 brief 又没给 task 时应能建会话')
+  eq(out.handoffCard.ok, true, 'brief 应落盘成功')
+  eq(out.handoffCard.source, 'brief', '来源应为 brief')
+  eq(out.handoffCard.written, true, 'brief 卡应真的写盘')
+  ok(out.handoffCard.bytes <= 2048, `卡字节数应 ≤2048（实际 ${out.handoffCard.bytes}）`)
+  ok(fs.existsSync(out.handoffCard.path), '回执给的卡路径必须存在')
+  ok(fs.readFileSync(out.handoffCard.path, 'utf8').includes('只读这一张'), '卡里应是 brief 原文')
+  ok(path.dirname(out.handoffCard.path) === path.join(stateDir, 'handoff'), '卡只许写在 <stateDir>/handoff/')
+  const envelope = created.sent[0].payload.content[0].text
+  ok(envelope.includes('本轮只做四件事'), 'brief 没配 task 时任务应是固定短模板')
+  ok(envelope.includes(out.handoffCard.path), '短模板必须带上卡的绝对路径')
+  ok(envelope.includes('本轮不改任何文件、不开工'), '短模板必须写明本轮不改文件')
+}
+
+{
+  // brief + 显式 task ⇒ task 一字不改（brief 只负责落盘），这是"显式优先"的硬约束。
+  const created = makeAgent(ID.C, { cwd: cardCwd })
+  const controller = { create: async () => ({ sessionId: ID.C }) }
+  const out = await call(
+    mount({ controller, get: () => created, stateDir: path.join(root, 'state-card-brief-task') }),
+    'create_domain_session',
+    { domain: 'asr', task: '我自己的开工任务', brief: { note: '对象型 brief' } },
+    { agent: cardSender },
+    'create/brief-object-with-task',
+  )
+  eq(out.handoffCard.source, 'brief', '对象型 brief 也算 brief 来源')
+  const envelope = created.sent[0].payload.content[0].text
+  ok(envelope.includes('我自己的开工任务'), '显式 task 必须原样保留')
+  ok(!envelope.includes('本轮只做四件事'), '显式 task 不得被短模板覆盖')
+  ok(fs.readFileSync(out.handoffCard.path, 'utf8').includes('对象型 brief'), '对象型 brief 应 JSON 化后落盘')
+}
+
+{
+  // 既没 brief 也没 task ⇒ 从 PROJECT.md 自动生成卡，并套用同一份短模板。
+  const created = makeAgent(ID.C, { cwd: cardCwd })
+  const controller = { create: async () => ({ sessionId: ID.C }) }
+  const out = await call(
+    mount({ controller, get: () => created, stateDir: path.join(root, 'state-card-auto') }),
+    'create_domain_session',
+    { domain: 'asr' },
+    { agent: cardSender },
+    'create/card-auto',
+  )
+  eq(out.created, true, '有 PROJECT.md 时应能自动出卡并建会话')
+  eq(out.handoffCard.source, 'project-md', '来源应为 project-md')
+  ok(out.handoffCard.bytes <= 2048, '自动生成的卡也要 ≤2048 B')
+  const envelope = created.sent[0].payload.content[0].text
+  ok(envelope.includes('本轮只做四件事'), '自动出卡时任务应是短模板')
+  ok(envelope.includes(out.handoffCard.path), '自动出卡时短模板必须带卡路径')
+  ok(!envelope.includes('状态四'), '只取前 3 条：第 4 条不得进任务/卡')
+}
+
+{
+  // dryRun：只算不写（演练承诺"不产生副作用"），但路径/字节数照报。
+  const stateDir = path.join(root, 'state-card-dry')
+  const out = await call(
+    mount({ stateDir }),
+    'create_domain_session',
+    { domain: 'asr', dryRun: true },
+    { agent: cardSender },
+    'create/card-dry-run',
+  )
+  eq(out.dryRun, true, '应是演练回执')
+  eq(out.handoffCard.ok, true, '演练里卡应"算得出来"')
+  eq(out.handoffCard.written, false, '演练里绝不能写盘')
+  ok(!fs.existsSync(out.handoffCard.path), '演练后卡文件不得存在')
+  ok(out.wouldDeliver.envelope.includes('本轮只做四件事'), '演练的任务文本也要是真实短模板')
+}
+
+{
+  // 超长 brief：按字节截断到 ≤2048（不在多字节字符中间切）。
+  const created = makeAgent(ID.C, { cwd: cardCwd })
+  const controller = { create: async () => ({ sessionId: ID.C }) }
+  const out = await call(
+    mount({ controller, get: () => created, stateDir: path.join(root, 'state-card-huge') }),
+    'create_domain_session',
+    { domain: 'asr', brief: '很长的一张卡'.repeat(500) },
+    { agent: cardSender },
+    'create/brief-too-long',
+  )
+  ok(out.handoffCard.bytes <= 2048, `超长 brief 必须截断到 ≤2048 B（实际 ${out.handoffCard.bytes}）`)
+  const text = fs.readFileSync(out.handoffCard.path, 'utf8')
+  ok(!text.includes('\uFFFD'), '按字节截断不得切坏多字节字符（不能出现替换字符）')
+}
+
+{
+  // 既没 brief/task，也没有 PROJECT.md ⇒ 仍是 missing-task（老行为不变）。
+  const bareCwd = path.join(root, 'card-bare')
+  fs.mkdirSync(bareCwd, { recursive: true })
+  const out = await call(
+    mount(),
+    'create_domain_session',
+    { domain: 'asr' },
+    { agent: makeAgent(ID.S, { cwd: bareCwd }) },
+    'create/no-material-missing-task',
+  )
+  eq(out.reason, 'missing-task', '什么素材都没有时应回 missing-task')
+}
+
 // ------------------------------------------------- 7. create_domain_session: attach + pin (v0.3.2)
 
 // Real-machine instance: the fixture cwd is a real workspace in the host registry.
