@@ -13,10 +13,18 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { VERSION, shortId, textOf } from './shared.js'
+import { VERSION, shortId, textOf, stateRoot } from './shared.js'
 import { readRegistrations, listRegistrations, projectOfCwd } from './registrations.js'
 import { loadDeclarations } from './declaration.js'
-import { loadDomainStates } from './pause.js'
+import {
+  loadDomainStates,
+  pauseCandidatesForSession,
+  pauseCandidatesGlobal,
+  pauseHitsOfMap,
+  pausedScopesOf,
+  pausedByScopesOf,
+  projectOfSessionDeclarations,
+} from './pause.js'
 import { loadInboxes } from './messaging.js'
 
 const STATE_ONLINE_ACTIVE = '在线·活动'
@@ -74,14 +82,73 @@ function cleanProjectName(value) {
   return name
 }
 
+/** 活 Agent 的 cwd（拿不到就是 null；绝不猜）。只有在线会话才有活 Agent。 */
+function cwdOfAgent(agent) {
+  try {
+    const cwd = agent?.session?.header?.cwd
+    return typeof cwd === 'string' && cwd.trim() ? cwd.trim() : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 一条会话在**四级政策轴**上的有效状态（F-09：与 `list_domain_*` 同一套判定，OR 叠加）。
+ *   ① 它自己的 session 级；② 它所在项目；③ 它持有的域级（held-domain）；④ global。
+ *
+ * 为什么不直接用 `sessionPauseFields()`：那份只从**活 Agent 的 cwd** 推项目，而 /state 的行
+ * 常常是**离线**会话（没有活 Agent）；它们的项目只能从注册册/域名册拿。所以这里用同一批
+ * 导出的积木自己拼候选键——判定（`pauseHitsOfMap` → `lookupPauseRecord`）与 list_* 逐字同一套，
+ * 而不是第二套规则。
+ */
+function sessionPauseState({ id, project, cwd, states, declarations, ctx }) {
+  // 项目口径与 list_domain_* 一致：域名册声明里的项目优先，其次才是"册子里登记的项目"，
+  // 最后交给 pauseCandidatesForSession 用活 Agent 的 cwd 兜底。
+  const fromDeclarations = projectOfSessionDeclarations(declarations, id)?.project || null
+  const fromRow = textOf(project) ? textOf(project).toLowerCase() : null
+  const projectHint = fromDeclarations || fromRow || (cwd ? projectOfCwd(cwd).project : null)
+  const { candidates } = pauseCandidatesForSession(declarations, ctx, id, {
+    viaSession: 'self-session',
+    viaProject: 'self-project',
+    viaDomainFromSession: 'held-domain',
+    side: 'self',
+    projectHint,
+    projectFrom: fromDeclarations
+      ? '域名册里该会话持有的声明'
+      : fromRow
+        ? '这条会话在册子里登记的项目名（小写）'
+        : '这条会话活 Agent 的 cwd 目录名（小写）',
+  })
+  candidates.push(...pauseCandidatesGlobal())
+  const { hits } = pauseHitsOfMap(states, candidates)
+  return {
+    paused: hits.length > 0,
+    pausedScopes: pausedScopesOf(hits),
+    pausedByScopes: pausedByScopesOf(hits),
+    pausedDomains: hits
+      .filter((hit) => hit.scope === 'domain')
+      .map((hit) => String(hit.key))
+      .sort(),
+  }
+}
+
 /**
  * One session row. `pending` counts queue records whose key matches either the domain key or the
  * session id (the queue keys by *the target's own key*, so a domain session can be counted twice).
+ *
+ * F-09：`paused` / `state` 与 `list_domain_*` **同口径**——四级 OR（会话自己 / 它所在项目 /
+ * 它持有的域 / global），而不是只看 session 级；`pausedScopes` / `pausedByScopes` 把
+ * "到底是哪几级按着、谁按的"原样带出去。
  */
-function sessionRow({ sessionId, projects, layer, key, project, domain, live, pausedBySession, lastActivity, missionCount, pendingByKey }) {
+function sessionRow({ sessionId, projects, layer, key, project, domain, live, states, book, ctx, lastActivity, missionCount, pendingByKey }) {
   const id = String(sessionId || '')
   const online = live.has(id)
-  const paused = pausedBySession.get(id) || null
+  const pause = sessionPauseState({ id, project, cwd: cwdOfAgent(live.get(id)), states, declarations: book, ctx })
+  const hits = Array.isArray(pause.pausedByScopes) ? pause.pausedByScopes : []
+  // 旧字段（pausedAt/pausedBy/pausedNote）语义不变：优先给「这条会话自己那一级」的记录，
+  // 没有就退回第一条命中——总比"被项目/全局按着、却报成没人按"诚实。
+  const own = hits.find((hit) => hit.scope === 'session') || hits[0] || null
+  const paused = pause.paused === true
   const domainKey = domain && project ? `${project}:${domain}` : null
   const pending =
     (pendingByKey.get(id.toLowerCase()) || 0) + (domainKey ? pendingByKey.get(domainKey.toLowerCase()) || 0 : 0)
@@ -101,11 +168,15 @@ function sessionRow({ sessionId, projects, layer, key, project, domain, live, pa
             ? `域会话 · ${domain}`
             : '会话',
     online,
-    paused: Boolean(paused),
+    paused,
     state: paused ? (online ? STATE_ONLINE_PAUSED : STATE_OFFLINE_PAUSED) : online ? STATE_ONLINE_ACTIVE : STATE_OFFLINE_ACTIVE,
-    pausedAt: paused?.pausedAt || null,
-    pausedBy: paused?.pausedBy || null,
-    pausedNote: paused?.note || paused?.pauseNote || null,
+    pausedAt: own?.pausedAt || null,
+    pausedBy: own?.pausedBy || null,
+    pausedNote: own?.pauseNote || null,
+    // F-09：哪几级按着（全量，不只报一个）；`pausedDomains` 是该会话持有的、被按下的域键。
+    pausedScopes: Array.isArray(pause.pausedScopes) ? pause.pausedScopes : [],
+    pausedByScopes: hits,
+    pausedDomains: Array.isArray(pause.pausedDomains) ? pause.pausedDomains : [],
     pending,
     lastActivity: lastActivity.get(id) || null,
     missions: missionCount.get(id) || 0,
@@ -152,9 +223,10 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
   const declarations = (loaded && Array.isArray(loaded.entries) ? loaded.entries : []).slice()
   if (loaded && loaded.error) warnings.push(`域声明读不懂（${loaded.error}）`)
 
+  let states = null
   let pausedEntries = []
   try {
-    const states = loadDomainStates(config.stateDir)
+    states = loadDomainStates(config.stateDir)
     pausedEntries = (states && Array.isArray(states.entries) ? states.entries : []).filter((row) => row && row.paused === true)
     if (states && states.error) warnings.push(`暂停状态读不懂（${states.error}）`)
   } catch (error) {
@@ -175,6 +247,15 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
       if (count) pendingByKey.set(key, count)
     }
     if (inbox.error) warnings.push(`队列目录读不懂（${inbox.error}）`)
+    // F-08：坏行 / 不可读文件以前被静默丢掉（totals.pending 少计、warnings 空）。
+    // 这里复用 loadInboxes() 已有的 degraded 信息，一行一条进 warnings；
+    // pending 仍只统计能读的行（坏行没有状态可依，硬凑数字就是编），这句说明跟着一起给。
+    for (const item of Array.isArray(inbox.degraded) ? inbox.degraded : []) {
+      warnings.push(
+        `队列文件 ${item.file} 有读不懂的行或读不动（${item.error}）⇒ 能读的行照常统计，` +
+          '坏行/整个文件**没有**计入 pending（pending 只数能读的行）；请人工看一眼这个文件',
+      )
+    }
   } catch (error) {
     warnings.push(`队列读取失败（${error?.message || String(error)}）`)
   }
@@ -215,7 +296,9 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
           project: row.project,
           domain: row.domain,
           live,
-          pausedBySession,
+          states,
+          book: loaded,
+          ctx,
           lastActivity,
           missionCount,
           pendingByKey,
@@ -237,7 +320,9 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
           project: row.project,
           domain: row.domain,
           live,
-          pausedBySession,
+          states,
+          book: loaded,
+          ctx,
           lastActivity,
           missionCount,
           pendingByKey,
@@ -374,7 +459,9 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
         project: row.project,
         domain: row.domain,
         live,
-        pausedBySession,
+        states,
+        book: loaded,
+        ctx,
         lastActivity,
         missionCount,
         pendingByKey,
@@ -382,11 +469,18 @@ export function buildStateSnapshot(ctx, deps, opts = {}) {
     )
 
   const sessions = [...bySession.values()]
+  // F-10：`reads.stateDir` 以前是 `config.stateDir || null`，而配置里通常**不写** stateDir
+  // （默认值 `<home>/state` 由 stateRoot() 解析）⇒ 字段恒为 null。这里报**真正读盘用的那个目录**
+  // （与 loadDomainStates/loadInboxes 内部同一口径）；真解析不出来就省略该字段，不拿 null 冒充。
+  const resolvedStateDir = stateRoot(config.stateDir)
+  const reads = { domainsFile: config.domainsFile || null }
+  if (resolvedStateDir) reads.stateDir = resolvedStateDir
+  reads.indexFile = config.indexFile || null
   return {
     ok: true,
     plugin: VERSION,
     generatedAt: new Date().toISOString(),
-    reads: { domainsFile: config.domainsFile || null, stateDir: config.stateDir || null, indexFile: config.indexFile || null },
+    reads,
     freshness: {
       indexAt: index && index.generatedAt ? index.generatedAt : null,
       domainsMtime: (() => {

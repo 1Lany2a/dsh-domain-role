@@ -16,7 +16,10 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 const MODULE_URL = new URL('../lib/core/registrations.js', import.meta.url).href
+const DECLARATION_URL = new URL('../lib/core/declaration.js', import.meta.url).href
 const mod = await import(MODULE_URL)
+const declarationMod = await import(DECLARATION_URL)
+const { updateDeclarations } = declarationMod
 const {
   readRegistrations,
   readRegistrationsForWrite,
@@ -192,6 +195,39 @@ for (let i = 0; i < rounds; i++) {
   }
 }
 fs.writeFileSync(resultFile, JSON.stringify({ failed, last, rounds }), 'utf8')
+`
+
+/**
+ * F-03 子进程脚本：反复调用**真的** `claim_domain` 工具（不是模拟它的读写），每轮都是一次完整的
+ * 读-改-写。两个子进程各认领**不同的域**；修复后两条声明必须在每一轮之后都还在。
+ */
+const CLAIM_CHILD_SOURCE = `
+import fs from 'node:fs'
+
+const [declarationUrl, file, stateDir, domain, sessionId, roundsText, readyFile, goFile, resultFile] = process.argv.slice(2)
+const rounds = Number(roundsText)
+const { buildClaimTool } = await import(declarationUrl)
+const ctx = { agents: { get: () => null, list: () => [] } }
+const definition = buildClaimTool(ctx, { domainsFile: file, stateDir, indexFile: '', ownerCli: '' })
+const agent = { id: sessionId, session: { header: {} } }
+
+fs.writeFileSync(readyFile, '1')
+const deadline = Date.now() + 20000
+while (!fs.existsSync(goFile)) {
+  if (Date.now() > deadline) {
+    fs.writeFileSync(resultFile, JSON.stringify({ failed: -1, reason: 'barrier-timeout' }), 'utf8')
+    process.exit(0)
+  }
+}
+
+let failed = 0
+const outcomes = []
+for (let i = 0; i < rounds; i++) {
+  const out = await definition.execute({ domain }, { agent })
+  outcomes.push(out.outcome)
+  if (!out.wrote) failed++
+}
+fs.writeFileSync(resultFile, JSON.stringify({ failed, rounds, outcomes }), 'utf8')
 `
 
 /** 真并发跑一轮：两个子进程、不同键、同一个文件、同一个屏障。
@@ -614,6 +650,121 @@ try {
       note = `旧写法的诊断没跑完（${error?.message || error}）`
     }
     console.log(`[registrations] 并发诊断：${note}`)
+  }
+
+  // ------------------------------------------------------------------ 14. F-03：claim_domain 的读-改-写必须整段在锁里
+  useCase('F-03：两个子进程同时 claim_domain 不同域 ⇒ 两条都在')
+  {
+    const rounds = 5
+    for (let rep = 0; rep < 2; rep++) {
+      const file = bookPath(`claim-race-${rep}`)
+      writeJson(file, {
+        schemaVersion: 1,
+        updatedAt: '2026-10-24T00:00:00.000Z',
+        owners: {},
+        registrations: {},
+      })
+      const dir = path.dirname(file)
+      const stateDir = path.join(dir, 'state')
+      const script = path.join(dir, 'claim-child.mjs')
+      fs.writeFileSync(script, CLAIM_CHILD_SOURCE, 'utf8')
+      const goFile = path.join(dir, 'go')
+      const plan = [
+        { domain: 'racea:alpha', sessionId: SID.A, ready: path.join(dir, 'a.ready') },
+        { domain: 'raceb:beta', sessionId: SID.B, ready: path.join(dir, 'b.ready') },
+      ]
+      const runs = plan.map((item, index) =>
+        runChild(
+          [
+            script,
+            DECLARATION_URL,
+            file,
+            stateDir,
+            item.domain,
+            item.sessionId,
+            String(rounds),
+            item.ready,
+            goFile,
+            path.join(dir, `result-${index}.json`),
+          ],
+          path.join(dir, `result-${index}.json`),
+        ),
+      )
+      await waitFor(() => plan.every((item) => fs.existsSync(item.ready)), 20000, `认领并发子进程就绪（第 ${rep + 1} 轮）`)
+      fs.writeFileSync(goFile, '1', 'utf8')
+      const finished = await Promise.all(runs)
+      for (const [index, run] of finished.entries()) {
+        eq(run.code, 0, `认领并发子进程 #${index + 1} 应正常退出（code=${run.code}）`)
+        eq(
+          run.payload?.failed,
+          0,
+          `认领并发子进程 #${index + 1} 每一轮都该 wrote:true：${JSON.stringify(run.payload)}`,
+        )
+      }
+      const after = JSON.parse(readRaw(file))
+      eq(
+        Object.keys(after.owners).sort(),
+        ['racea:alpha', 'raceb:beta'],
+        `第 ${rep + 1} 轮：两个域必须都在（读-改-写整段在同一次锁里；以前 5/5 轮只剩 1 条）`,
+      )
+    }
+  }
+
+  // ------------------------------------------------------------------ 15. F-19：旧快照写被拒（stale-book）
+  useCase('F-19：读与写之间被锁外写者改过 ⇒ stale-book 拒绝且不覆盖')
+  {
+    const file = bookPath('stale-book')
+    writeJson(file, {
+      schemaVersion: 1,
+      updatedAt: '2026-10-24T00:00:00.000Z',
+      owners: { 'keep:me': ownerRecord('keep', 'me', SID.C) },
+      registrations: {},
+    })
+    // 模拟"不守锁的写者"（外部 CLI 的固定名 tmp / 人手工编辑）：在锁外直接改书。
+    // 每次写进去的 note 都不同，保证字节版本真的变了（同一毫秒内两次相同内容＝同一版本，不算被改）。
+    let externalSeq = 0
+    const externalWrite = (ownerKey) => {
+      const disk = JSON.parse(readRaw(file))
+      const [project, domain] = ownerKey.split(':')
+      disk.owners[ownerKey] = { ...ownerRecord(project, domain, SID.C), note: `外部写 #${++externalSeq}` }
+      disk.updatedAt = new Date().toISOString()
+      fs.writeFileSync(file, JSON.stringify(disk, null, 2) + '\n', 'utf8')
+    }
+    const refused = updateDeclarations(
+      file,
+      (doc) => {
+        doc.owners['mine:new'] = ownerRecord('mine', 'new', SID.A)
+        return { write: true, value: { touched: true } }
+      },
+      { beforeWrite: () => externalWrite('external:win') },
+    )
+    eq(refused.ok, false, '读与写之间持续被外部改写 ⇒ 必须拒绝写')
+    eq(refused.reason, 'stale-book', 'reason 必须是 stale-book')
+    const afterRefused = JSON.parse(readRaw(file))
+    ok(!afterRefused.owners['mine:new'], 'stale-book 时自己的改动一个字都不能落盘')
+    ok(Boolean(afterRefused.owners['external:win']), '外部那次写入必须原样保住')
+    eq(afterRefused.owners['keep:me'], ownerRecord('keep', 'me', SID.C), '原有声明也必须原样保住')
+
+    // 只被改一次 ⇒ 重读重试一次后成功（不是"一有风吹草动就永久拒绝"），且两边的键都在。
+    let hooks = 0
+    const retried = updateDeclarations(
+      file,
+      (doc) => {
+        doc.owners['mine:new'] = ownerRecord('mine', 'new', SID.A)
+        return { write: true, value: { touched: true } }
+      },
+      {
+        beforeWrite: () => {
+          hooks += 1
+          if (hooks === 1) externalWrite('external:second')
+        },
+      },
+    )
+    eq(retried.ok, true, '只被改一次时应重读重试一次并成功')
+    eq(retried.retried, true, 'retried 必须如实标 true')
+    const afterRetry = JSON.parse(readRaw(file))
+    ok(Boolean(afterRetry.owners['mine:new']), '重试成功后自己的键必须在')
+    ok(Boolean(afterRetry.owners['external:second']), '外部那一次的键也必须保住')
   }
 
   // ------------------------------------------------------------------ 13. projectOfCwd

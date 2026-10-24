@@ -488,22 +488,74 @@ export async function runMenuChoice(ctx, deps, { command, sessionId, input }) {
   return runCommandLine(ctx, definition, agent, line, input)
 }
 
+/**
+ * 只接受本机 Host 头（F-11）：`127.0.0.1[:port]` / `localhost[:port]` / `[::1][:port]`。
+ * IPv6 字面量在 Host 里带方括号（`[::1]:8652`）——以前只认前两种，于是从 `[::1]` 打开页面时
+ * 所有 /api/dsh-domain-bridge/* 直接被 403（本机被误当成外部主机）。这里只补上 `[::1]`，
+ * 其余判据不变（别的主机名一律拒绝）。
+ */
+function localOnly(req) {
+  const host = String(req.headers.host || '').trim().toLowerCase()
+  if (!host) return false
+  if (host === '[::1]' || host.startsWith('[::1]:')) return true
+  return host.startsWith('127.0.0.1:') || host.startsWith('localhost:') || host === '127.0.0.1' || host === 'localhost'
+}
+
+/** 请求体上限（字节）：超过就**停止读取并拒绝**，绝不把截断内容当合法输入（F-12）。 */
+const MAX_BODY_BYTES = 65536
+
+/**
+ * Read the JSON request body.
+ * 返回 `{ ok:true, body }` 或 `{ ok:false, reason, error }`。
+ * F-12：以前超限时静默截断成 65536 字符再 JSON.parse ⇒ 解析成 `{}` ⇒ 回「未知命令」，
+ * 调用方完全看不出真正原因。现在读到上限即停、**丢弃已读内容**，由调用方回 413 +
+ * `{ok:false, reason:'body-too-large'}`。
+ * 其它读取/解析失败保持旧行为：解析失败退化成空对象（命令层自己会回「未知命令」），
+ * 只有 `req` 级错误才给 `body-read-failed`。
+ */
 function readBody(req) {
   return new Promise((resolve) => {
-    let raw = ''
+    const chunks = []
+    let size = 0
+    let tooLarge = false
     req.on('data', (chunk) => {
-      raw += chunk
-      if (raw.length > 65536) raw = raw.slice(0, 65536)
+      if (tooLarge) return
+      // 按**字节**累计（含多字节字符）：不上限换算成字符，也不在 chunk 边界上切坏一个字符。
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
+      size += buffer.length
+      if (size > MAX_BODY_BYTES) {
+        tooLarge = true
+        chunks.length = 0
+        return
+      }
+      chunks.push(buffer)
     })
     req.on('end', () => {
+      if (tooLarge) {
+        resolve({
+          ok: false,
+          body: null,
+          reason: 'body-too-large',
+          error: `请求体超过上限（${MAX_BODY_BYTES} 字节）：已停止读取且没有把它当合法输入。`,
+        })
+        return
+      }
       try {
-        resolve(JSON.parse(raw || '{}'))
+        resolve({ ok: true, body: JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'), reason: null, error: null })
       } catch {
-        resolve({})
+        resolve({ ok: true, body: {}, reason: null, error: null })
       }
     })
-    req.on('error', () => resolve({}))
+    req.on('error', (error) => {
+      resolve({ ok: false, body: null, reason: 'body-read-failed', error: error?.message || String(error) })
+    })
   })
+}
+
+/** 请求体不可用时的统一回执：超限 ⇒ 413（F-12），其它读取失败 ⇒ 400。 */
+function rejectBody(res, parsed) {
+  const status = parsed.reason === 'body-too-large' ? 413 : 400
+  writeJson(res, status, { ok: false, reason: parsed.reason, error: parsed.error })
 }
 
 function writeJson(res, status, value) {
@@ -541,11 +593,6 @@ function liveAgentOf(ctx, sessionId) {
   } catch {
     return null
   }
-}
-
-function localOnly(req) {
-  const host = String(req.headers.host || '').toLowerCase()
-  return host.startsWith('127.0.0.1:') || host.startsWith('localhost:') || host === '127.0.0.1' || host === 'localhost'
 }
 
 /** Register the two routes; a missing webServer degrades to "no popup transport" (typed commands still work). */
@@ -618,7 +665,9 @@ export function registerMenuRoutes(ctx, deps) {
     path: `${ROUTE_PREFIX}/menu`,
     handler: async (req, res) => {
       if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
-      const body = await readBody(req)
+      const parsed = await readBody(req)
+      if (!parsed.ok) return rejectBody(res, parsed)
+      const body = parsed.body
       const sessionId = String(body.sessionId || '')
       let cwd = null
       try {
@@ -637,7 +686,9 @@ export function registerMenuRoutes(ctx, deps) {
     path: `${ROUTE_PREFIX}/run`,
     handler: async (req, res) => {
       if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
-      const body = await readBody(req)
+      const parsed = await readBody(req)
+      if (!parsed.ok) return rejectBody(res, parsed)
+      const body = parsed.body
       try {
         const out = await runMenuChoice(ctx, deps, {
           command: String(body.command || ''),
@@ -718,7 +769,9 @@ export function registerMenuRoutes(ctx, deps) {
     path: `${ROUTE_PREFIX}/handoff-wizard/run`,
     handler: async (req, res) => {
       if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
-      const body = await readBody(req)
+      const parsed = await readBody(req)
+      if (!parsed.ok) return rejectBody(res, parsed)
+      const body = parsed.body
       try {
         writeJson(res, 200, await runWizard(ctx, deps, { sessionId: String(body.sessionId || ''), params: body }))
       } catch (error) {

@@ -126,4 +126,105 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(snap.warnings.some((line) => line.includes('注册册')), '坏文件必须进 warnings，不许静默')
 }
 
+// 6. F-08：坏队列行 / 不可读文件不许静默丢 —— 进 warnings 并说明 pending 只数能读的行
+{
+  const inboxDir = path.join(stateDir, 'inbox')
+  fs.writeFileSync(
+    path.join(inboxDir, 'k-broken-queue.jsonl'),
+    '{ this is not json\n' +
+      JSON.stringify({ id: 'm9', key: 'brokenqueue:dom', status: 'pending', mode: 'followup', at: new Date().toISOString() }) +
+      '\n',
+    'utf8',
+  )
+  // 整个文件读不动（目录冒充 .jsonl）：loadInboxes 的 degraded 必须把它也列出来。
+  fs.mkdirSync(path.join(inboxDir, 'k-unreadable.jsonl'), { recursive: true })
+
+  const snap = buildStateSnapshot(ctx, deps, {})
+  ok(
+    snap.warnings.some((line) => line.includes('队列文件') && line.includes('没有') && line.includes('pending')),
+    'F-08：坏行必须并进 warnings，并说明坏行没有计入 pending',
+  )
+  ok(
+    snap.warnings.some((line) => line.includes('k-unreadable.jsonl')),
+    'F-08：读不动的队列文件也必须进 warnings（不许静默）',
+  )
+  ok(snap.totals.pending === 2, `F-08：pending 只数能读的行（期望 2：other:main 1 + brokenqueue 1，实际 ${snap.totals.pending}）`)
+}
+
+// 7. F-09：project / global 暂停必须体现在会话行上（与 list_domain_* 同口径，四级 OR 叠加）
+{
+  writeDomainStateAtomic(
+    stateDir,
+    'other',
+    { paused: true, pausedAt: '2026-10-21T00:00:00.000Z', pausedBy: 'session-presser', note: '项目级暂停' },
+    'project',
+  )
+  writeDomainStateAtomic(
+    stateDir,
+    '*',
+    { paused: true, pausedAt: '2026-10-21T00:00:01.000Z', pausedBy: 'session-boss', note: '全局暂停' },
+    'global',
+  )
+  const snap = buildStateSnapshot(ctx, deps, {})
+  ok(
+    snap.totals.paused === 3,
+    `F-09：totals.paused 应数到三级（session 历史 1 + project 1 + global 1，实际 ${snap.totals.paused}）`,
+  )
+
+  const offlineMain = snap.sessions.find((row) => row.id === 'session-offline01')
+  ok(!!offlineMain, 'F-09：项目主会话行应存在')
+  ok(offlineMain.paused === true, 'F-09：project 暂停必须把该项目的会话行标成 paused（以前只看 session 级）')
+  ok(offlineMain.state === '离线·已暂停', `F-09：离线行派生状态应为 离线·已暂停（实际 ${offlineMain.state}）`)
+  ok(
+    offlineMain.pausedScopes.includes('project') && offlineMain.pausedScopes.includes('global'),
+    'F-09：pausedScopes 要如实标出是哪几级按着（project + global）',
+  )
+  ok(
+    Array.isArray(offlineMain.pausedByScopes) && offlineMain.pausedByScopes.some((hit) => hit.scope === 'global'),
+    'F-09：pausedByScopes 要给到具体是哪一级、谁按的',
+  )
+
+  const liveRow = snap.sessions.find((row) => row.id === liveId)
+  ok(liveRow && liveRow.paused === true && liveRow.state === '在线·已暂停', 'F-09：global 暂停必须把在线会话行标成 在线·已暂停')
+  ok(liveRow.pausedScopes.includes('global'), 'F-09：在线行也要标出 global')
+
+  // 清理：把这两级恢复，别影响后面的用例。
+  writeDomainStateAtomic(stateDir, 'other', { paused: false }, 'project')
+  writeDomainStateAtomic(stateDir, '*', { paused: false }, 'global')
+}
+
+// 8. F-10：reads.stateDir 必须是真正读盘用的目录（不是恒 null）
+{
+  const snap = buildStateSnapshot(ctx, deps, {})
+  ok(snap.reads.stateDir === stateDir, `F-10：显式配置时 reads.stateDir 应是配置的真实路径（实际 ${snap.reads.stateDir}）`)
+  ok(snap.reads.stateDir !== null, 'F-10：reads.stateDir 不许是 null')
+
+  const previousHome = process.env.DSH_DOMAIN_BRIDGE_HOME
+  const fakeHome = path.join(root, 'fake-home')
+  process.env.DSH_DOMAIN_BRIDGE_HOME = fakeHome
+  try {
+    const expected = path.join(fakeHome, 'state')
+    const defaultSnap = buildStateSnapshot(ctx, { config: { domainsFile, stateDir: '', indexFile } }, {})
+    ok(
+      defaultSnap.reads.stateDir === expected,
+      `F-10：没配 stateDir 时应报解析出来的默认目录（期望 ${expected}，实际 ${defaultSnap.reads.stateDir}）`,
+    )
+    // 与真正读盘用的目录一致：往同一个默认目录写一条暂停记录，快照必须看得见。
+    writeDomainStateAtomic(
+      '',
+      'defaultdir:probe',
+      { paused: true, pausedAt: '2026-10-22T00:00:00.000Z', pausedBy: 'session-probe', note: '默认状态目录探针' },
+      'domain',
+    )
+    const seen = buildStateSnapshot(ctx, { config: { domainsFile, stateDir: '', indexFile } }, {})
+    ok(
+      seen.totals.paused === 1 && seen.reads.stateDir === expected,
+      'F-10：reads.stateDir 必须就是真正读盘用的那个目录（写进去的暂停记录要能看见）',
+    )
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_DOMAIN_BRIDGE_HOME
+    else process.env.DSH_DOMAIN_BRIDGE_HOME = previousHome
+  }
+}
+
 console.log(`[state] 用例 ${passed} 条全部通过`)

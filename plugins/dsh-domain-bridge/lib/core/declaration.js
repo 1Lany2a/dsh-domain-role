@@ -7,6 +7,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { PLUGIN, VERSION, TRACE_ID, TRACE_ID_V040, SCOPE_DOMAIN, STATE_TERMINATED, loadIndex, emptyIndex, shortId, describe, liveTopLevel, dutyMap, isSessionOnline, ownerCliRef, messageOf } from './shared.js'
 import { warn, tool } from './tools.js'
 import { INBOX_DELIVERED, loadInbox, loadInboxes, domainEnvelope, domainMessage, deliverToAgent } from './messaging.js'
@@ -114,24 +115,61 @@ export function normalizeDeclarations(data) {
 }
 
 /**
+ * 域名册的**内容版本**（F-19）：原始字节的 sha1；文件不存在 ⇒ `'absent'`；`null` ＝ 读不出来。
+ * 写前用它比对「本段读到的书」与「磁盘上现在这本书」——不一致就说明有别的进程（或外部 CLI）
+ * 刚写过，绝不拿旧快照静默覆盖。
+ */
+function versionOfRaw(raw) {
+  try {
+    return createHash('sha1').update(raw).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+function bookVersionOnDisk(file) {
+  try {
+    return versionOfRaw(fs.readFileSync(file))
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return 'absent'
+    return null
+  }
+}
+
+/**
  * Read for writing. A missing file seeds an empty book (normal state); a file that exists but
  * cannot be parsed ABORTS the write - never overwrite other people's declarations blindly.
+ *
+ * `version` ＝ 这次读到的字节版本（供 `updateDeclarations()` 写前比对，F-19）。
  */
 export function readDeclarationsForWrite(file) {
   let raw
   try {
-    raw = fs.readFileSync(file, 'utf8')
+    raw = fs.readFileSync(file)
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      return { data: seedDeclarations(), fileExisted: false, parseError: null }
+      return { data: seedDeclarations(), fileExisted: false, parseError: null, version: 'absent' }
     }
-    return { data: null, fileExisted: true, parseError: error?.message || String(error) }
+    return { data: null, fileExisted: true, parseError: error?.message || String(error), version: null }
   }
+  const version = versionOfRaw(raw)
   try {
-    return { data: normalizeDeclarations(JSON.parse(raw)), fileExisted: true, parseError: null }
+    return { data: normalizeDeclarations(JSON.parse(raw.toString('utf8'))), fileExisted: true, parseError: null, version }
   } catch (error) {
-    return { data: null, fileExisted: true, parseError: error?.message || String(error) }
+    return { data: null, fileExisted: true, parseError: error?.message || String(error), version }
   }
+}
+
+/**
+ * 写整本域名册（唯一名 tmp + 原子替换），**调用方必须已经持有那把进程间锁**。
+ * 这是本文件唯一的字节级写出口；`writeDeclarationsAtomic()` / `updateDeclarations()` 各自在
+ * 已持锁的位置调它。**绝不在 `withDomainsLock()` 的回调里再调带锁的那两个包装**——锁不可重入。
+ * 成功回 `{bytes}`，失败**抛错**（与 writeAtomicUnique 一致）。
+ */
+function writeDeclarationsUnlocked(file, data) {
+  data.updatedAt = new Date().toISOString()
+  const body = JSON.stringify(data, null, 2) + '\n'
+  return writeAtomicUnique(file, body)
 }
 
 /**
@@ -145,14 +183,133 @@ export function readDeclarationsForWrite(file) {
  *   ② tmp 换成**唯一名**（`<file>.<pid>.<rand>.tmp`）—— 固定名 `<file>.tmp` 在并发下会静默丢写
  *      （实测：A 报成功、内容却被 B 冲掉），而且外部 CLI（domain-owner.mjs）仍用固定名 tmp，
  *      唯一名才不会跟它撞车。
+ *
+ * ⚠️ 锁的调用约定（F-03 死锁自查，**不可重入**）：本函数会自己取锁；凡是已经在一把锁里的地方
+ *    （`updateDeclarations()` 的回调、`claim_domain` / `release_domain` 的读-改-写段）**只准**
+ *    调 `writeDeclarationsUnlocked()`，绝不能再调本函数，否则同一个进程会等自己到超时。
  * 对外行为保持不变：成功回 `{bytes}`，失败**抛错**（调用方原有的 try/catch 一行都不用改）。
  */
 export function writeDeclarationsAtomic(file, data) {
-  data.updatedAt = new Date().toISOString()
-  const body = JSON.stringify(data, null, 2) + '\n'
-  const locked = withDomainsLock(file, () => writeAtomicUnique(file, body))
+  const locked = withDomainsLock(file, () => writeDeclarationsUnlocked(file, data))
   if (!locked.ok) throw new Error(locked.error || 'declaration-write-failed')
   return { bytes: locked.value.bytes }
+}
+
+/**
+ * 域名册的**加锁读-改-写**（F-03/F-19 的唯一入口）。
+ *
+ * 为什么要有它：以前 `claim_domain` / `release_domain` / `declareNewOwner` 在**锁外**先读书、
+ * 再调 `writeDeclarationsAtomic()`（只有写那一小段在锁里）⇒ 两个进程各读一份旧本，后写的把先写的
+ * 整条声明覆盖掉（实测：两进程各认领一个域，5/5 轮只剩 1 条，两边都回 ok）。现在**读、判断、写**
+ * 全在**同一次** `withDomainsLock()` 里，锁内绝不再取锁（回调只碰内存里的 doc，写走
+ * `writeDeclarationsUnlocked()`）。
+ *
+ * `apply(doc, { version, fileExisted, attempt })` 在锁内运行，**只准改 `doc` 的内存副本、不许做
+ * 外部副作用**（发消息、改标题、写别的文件都要等本函数返回后再做），且必须回
+ * `{ write: boolean, value?: any }`：`write:false` ＝ 只读结论（冲突 / 没有这条），一个字都不写。
+ *
+ * 写前比对（F-19）：真正落盘之前重新读一次磁盘版本，和本段读到的 `version` 比对；
+ *   · 一致 ⇒ 写；
+ *   · 不一致 ⇒ **重读重试一次**（重新跑 `apply`，判断基于新书）；
+ *   · 重试后仍不一致 ⇒ 如实回 `reason:'stale-book'`，**不写**（绝不静默覆盖）。
+ * 这把锁挡不住不守规矩的写者（例如外部 CLI 的固定名 tmp、或人手工编辑），所以这道比对是必要的兜底。
+ *
+ * `options.beforeWrite({ file, attempt, version })`：**只给测试用**的注入点，模拟"读与写之间有人
+ * 从锁外改了文件"，用来确定性地验证 stale-book 拒绝路径；生产调用不传。
+ *
+ * 回 `{ ok:true, value, bytes, retried }` 或 `{ ok:false, reason, error, retried }`（永不抛）。
+ */
+export function updateDeclarations(file, apply, options) {
+  const target = String(file ?? '')
+  if (!target) return { ok: false, value: null, bytes: null, retried: false, reason: 'no-file', error: '域名册路径为空。' }
+  if (typeof apply !== 'function') {
+    return {
+      ok: false,
+      value: null,
+      bytes: null,
+      retried: false,
+      reason: 'no-function',
+      error: 'updateDeclarations 需要一个要执行的改书写函数。',
+    }
+  }
+  const hooks = options && typeof options === 'object' ? options : {}
+  let retried = false
+
+  const locked = withDomainsLock(target, () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const read = readDeclarationsForWrite(target)
+      if (read.parseError) return { status: 'aborted', error: read.parseError }
+      const decision = apply(read.data, { version: read.version, fileExisted: read.fileExisted, attempt })
+      const plan = decision && typeof decision === 'object' ? decision : {}
+      if (plan.write === false) return { status: 'done', value: plan.value ?? null, bytes: null }
+
+      // 测试注入点：模拟"另一个不守锁的写者"在这两行之间改了文件。
+      if (typeof hooks.beforeWrite === 'function') hooks.beforeWrite({ file: target, attempt, version: read.version })
+
+      const current = bookVersionOnDisk(target)
+      if (current === null || current !== read.version) {
+        if (attempt === 0) {
+          retried = true
+          continue // 重读重试一次：apply 会基于新书重新判断
+        }
+        return {
+          status: 'stale-book',
+          error:
+            `域名册在读与写之间被别的进程改过（读到版本 ${read.version ?? '（读不出）'}，磁盘现在是 ` +
+            `${current ?? '（读不出）'}）：为避免用旧快照覆盖别人的新写入，本次没有写入任何东西。`,
+        }
+      }
+
+      try {
+        const written = writeDeclarationsUnlocked(target, read.data)
+        return { status: 'done', value: plan.value ?? null, bytes: written.bytes }
+      } catch (error) {
+        return { status: 'write-failed', error: messageOf(error) }
+      }
+    }
+    return {
+      status: 'stale-book',
+      error: '域名册连续两次在读与写之间被改动：为避免用旧快照覆盖别人的新写入，本次没有写入任何东西。',
+    }
+  })
+
+  if (!locked.ok) {
+    // 拿不到锁时：**只读结论**仍然可以给（没有写，就没有"用旧快照覆盖别人"的风险），
+    // 例如「这个域本来就没有声明（absent）」「已被别人持有（conflict）」。
+    // 要写的分支一律如实拒绝（绝不绕过锁裸写）。
+    if (locked.reason === 'lock-failed' || locked.reason === 'locked') {
+      const fallback = readDeclarationsForWrite(target)
+      if (!fallback.parseError) {
+        try {
+          const decision = apply(fallback.data, {
+            version: fallback.version,
+            fileExisted: fallback.fileExisted,
+            attempt: 0,
+            locked: false,
+          })
+          const plan = decision && typeof decision === 'object' ? decision : {}
+          if (plan.write === false) {
+            return { ok: true, value: plan.value ?? null, bytes: null, retried, error: null, readOnlyFallback: true }
+          }
+        } catch {
+          /* 只读兜底里 apply 抛错 ⇒ 退回"拿不到锁"的如实拒绝（绝不向外抛） */
+        }
+      }
+    }
+    return { ok: false, value: null, bytes: null, retried, reason: locked.reason || 'write-failed', error: locked.error }
+  }
+  const value = locked.value && typeof locked.value === 'object' ? locked.value : {}
+  if (value.status === 'done') {
+    return { ok: true, value: value.value ?? null, bytes: value.bytes ?? null, retried, error: null }
+  }
+  return {
+    ok: false,
+    value: null,
+    bytes: null,
+    retried,
+    reason: value.status === 'aborted' ? 'declarations-file-unreadable' : value.status || 'write-failed',
+    error: value.error ?? null,
+  }
 }
 
 // ------------------------------- portable runtime home (home / config.json / env / defaults)
@@ -374,42 +531,54 @@ export function resolveTarget(rows, rawTarget, declarations, ctx, index) {
 
 /** Never let an exotic throwable break a tool result. */
 export function declareNewOwner(file, { key, project, domain, ownerSessionId, note }) {
-  const read = readDeclarationsForWrite(file)
-  if (read.parseError) {
-    return { outcome: 'aborted', reason: 'declarations-file-unreadable', error: read.parseError, file }
-  }
-  const data = read.data
-  const existing = Object.prototype.hasOwnProperty.call(data.owners, key) ? data.owners[key] : null
-  // Read-only report of who is sitting there, so a conflict reply can name the blocking owner.
-  const holder = existing
-    ? {
-        key,
-        sessionId: existing.sessionId ?? null,
-        since: existing.since ?? null,
-        by: existing.by ?? null,
-        note: existing.note ?? null,
-      }
-    : null
+  // F-03：读、冲突判断、写全在**同一次**锁里（见 updateDeclarations 的 JSDoc）。
+  const write = updateDeclarations(file, (data) => {
+    const existing = Object.prototype.hasOwnProperty.call(data.owners, key) ? data.owners[key] : null
+    // Read-only report of who is sitting there, so a conflict reply can name the blocking owner.
+    const holder = existing
+      ? {
+          key,
+          sessionId: existing.sessionId ?? null,
+          since: existing.since ?? null,
+          by: existing.by ?? null,
+          note: existing.note ?? null,
+        }
+      : null
 
-  if (existing && existing.sessionId !== ownerSessionId) {
-    return { outcome: 'conflict', conflict: true, wrote: false, key, file, holder }
+    if (existing && existing.sessionId !== ownerSessionId) {
+      return { write: false, value: { conflict: true, holder } }
+    }
+
+    const owner = {
+      ...(existing || {}),
+      project,
+      domain,
+      sessionId: ownerSessionId,
+      since: new Date().toISOString(),
+      by: null,
+      note: note || '',
+    }
+    data.owners[key] = owner
+    return { write: true, value: { holder, owner } }
+  })
+
+  if (!write.ok) {
+    if (write.reason === 'declarations-file-unreadable') {
+      return { outcome: 'aborted', reason: 'declarations-file-unreadable', error: write.error, file }
+    }
+    return { outcome: 'write-failed', wrote: false, key, file, reason: write.reason, error: write.error }
   }
 
-  const owner = {
-    ...(existing || {}),
-    project,
-    domain,
-    sessionId: ownerSessionId,
-    since: new Date().toISOString(),
-    by: null,
-    note: note || '',
-  }
-  data.owners[key] = owner
-  try {
-    const result = writeDeclarationsAtomic(file, data)
-    return { outcome: 'claimed', wrote: true, key, file, owner, heldBefore: holder, bytes: result.bytes }
-  } catch (error) {
-    return { outcome: 'write-failed', wrote: false, key, file, error: messageOf(error) }
+  const value = write.value || {}
+  if (value.conflict) return { outcome: 'conflict', conflict: true, wrote: false, key, file, holder: value.holder || null }
+  return {
+    outcome: 'claimed',
+    wrote: true,
+    key,
+    file,
+    owner: value.owner,
+    heldBefore: value.holder || null,
+    bytes: write.bytes,
   }
 }
 
@@ -582,20 +751,21 @@ export function notifyPredecessor(ctx, { predecessorSessionId, domain, successor
  * 追加而不是覆盖：note 里原有的「接手自 …」留痕必须保住。
  */
 export function appendNoteLine(file, key, line) {
-  const read = readDeclarationsForWrite(file)
-  if (read.parseError) return { ok: false, reason: 'declarations-file-unreadable', error: read.parseError }
-  const data = read.data
-  if (!Object.prototype.hasOwnProperty.call(data.owners, key)) return { ok: false, reason: 'declaration-vanished' }
-  const existing = data.owners[key] && typeof data.owners[key] === 'object' ? data.owners[key] : {}
-  const before = typeof existing.note === 'string' ? existing.note : ''
-  const note = before ? before + '\n' + line : line
-  data.owners[key] = { ...existing, note }
-  try {
-    const result = writeDeclarationsAtomic(file, data)
-    return { ok: true, note, previousNote: before, bytes: result.bytes }
-  } catch (error) {
-    return { ok: false, reason: 'write-failed', error: messageOf(error) }
+  // F-03：同样是锁内读-改-写（本函数通常在 claim 的锁**已经释放之后**被调用，见 claim 的调用顺序）。
+  const write = updateDeclarations(file, (data) => {
+    if (!Object.prototype.hasOwnProperty.call(data.owners, key)) return { write: false, value: { vanished: true } }
+    const existing = data.owners[key] && typeof data.owners[key] === 'object' ? data.owners[key] : {}
+    const before = typeof existing.note === 'string' ? existing.note : ''
+    const note = before ? before + '\n' + line : line
+    data.owners[key] = { ...existing, note }
+    return { write: true, value: { note, previousNote: before } }
+  })
+  if (!write.ok) {
+    return { ok: false, reason: write.reason || 'write-failed', error: write.error }
   }
+  const value = write.value || {}
+  if (value.vanished) return { ok: false, reason: 'declaration-vanished' }
+  return { ok: true, note: value.note, previousNote: value.previousNote, bytes: write.bytes }
 }
 
 // --------------------------------------------------------------- tools
@@ -737,27 +907,11 @@ export function buildClaimTool(ctx, config) {
       }
       const key = project + ':' + split.domain
 
-      const read = readDeclarationsForWrite(config.domainsFile)
-      if (read.parseError) {
-        return {
-          action: 'claim',
-          outcome: 'aborted',
-          // reason 保持 declarations-file-unreadable（既有契约/冒烟断言），另给可判别的 code：
-          // 三条所有权敏感路径统一用 'domains-unreadable' 这个判别词（F-04）。
-          reason: 'declarations-file-unreadable',
-          code: 'domains-unreadable',
-          error: read.parseError,
-          file: config.domainsFile,
-          hint:
-            '域名册读不懂，不做所有权判断：声明文件已存在但读不懂，为避免覆盖别人的声明，本次没有写入任何文件。' +
-            '请人工修好 ' + config.domainsFile + '（文件不存在＝正常空册，不会被这条拦住）。',
-          self,
-        }
-      }
-      const data = read.data
-      const existing = Object.prototype.hasOwnProperty.call(data.owners, key) ? data.owners[key] : null
+      // F-03：读、冲突/交接判断、写全在**同一次**锁里；锁外只做通知/改名这类副作用。
+      // 约定：回调里只改内存 doc，绝不调 writeDeclarationsAtomic()（会自己等自己）。
+      const claimed = updateDeclarations(config.domainsFile, (doc) => {
+        const existing = Object.prototype.hasOwnProperty.call(doc.owners, key) ? doc.owners[key] : null
 
-      try {
         // Idempotent: the same session claiming again just refreshes the on-duty clock.
         if (existing && existing.sessionId === self.id) {
           const refreshed = {
@@ -768,45 +922,24 @@ export function buildClaimTool(ctx, config) {
             by: existing.by || null,
             note: userNote || existing.note || '',
           }
-          data.owners[key] = refreshed
-          const result = writeDeclarationsAtomic(config.domainsFile, data)
-          // ── v0.4.0/v0.4.2：刷新在岗时间**不动**政策轴；该域仍有任一级按着就如实提示（未暂停＝空对象）。
-          const pause = pausedNoticeOf(config, key, loadDeclarations(config.domainsFile))
-          return {
-            action: 'claim',
-            outcome: 'refreshed',
-            key,
-            owner: refreshed,
-            wrote: true,
-            bytes: result.bytes,
-            file: config.domainsFile,
-            ...pause,
-            self,
-            hint:
-              '该域本来就是你在任，已刷新在岗起算时间（幂等，不算冲突）。' +
-              (pause.pausedNotice ? pause.pausedNotice + pause.pausedHint : ''),
-          }
+          doc.owners[key] = refreshed
+          return { write: true, value: { status: 'refreshed', owner: refreshed } }
         }
 
         // Conflict: somebody else holds it and force was not requested.
         if (existing && existing.sessionId !== self.id && args.force !== true) {
           return {
-            action: 'claim',
-            outcome: 'conflict',
-            conflict: true,
-            key,
-            wrote: false,
-            file: config.domainsFile,
-            holder: {
-              sessionId: existing.sessionId ?? null,
-              since: existing.since ?? null,
-              by: existing.by ?? null,
-              note: existing.note ?? null,
-              online: isSessionOnline(ctx, existing.sessionId),
+            write: false,
+            value: {
+              status: 'conflict',
+              holder: {
+                sessionId: existing.sessionId ?? null,
+                since: existing.since ?? null,
+                by: existing.by ?? null,
+                note: existing.note ?? null,
+                online: isSessionOnline(ctx, existing.sessionId),
+              },
             },
-            self,
-            hint:
-              '该域已有在任负责人，本次没有覆盖任何东西。要换人：加 force=true 强制交接（旧负责人会写进 note 留痕），或先让在任方自己 release_domain。',
           }
         }
 
@@ -818,7 +951,7 @@ export function buildClaimTool(ctx, config) {
             : '接手自 ' + handoverFrom
           : userNote
         // Spread the previous record first so unknown fields are never dropped.
-        let owner = {
+        const owner = {
           ...(existing || {}),
           project,
           domain: split.domain,
@@ -827,17 +960,117 @@ export function buildClaimTool(ctx, config) {
           by: null,
           note,
         }
-        data.owners[key] = owner
-        const result = writeDeclarationsAtomic(config.domainsFile, data)
+        doc.owners[key] = owner
+        return { write: true, value: { status: 'written', owner, handoverFrom } }
+      })
+
+      if (!claimed.ok) {
+        if (claimed.reason === 'declarations-file-unreadable') {
+          return {
+            action: 'claim',
+            outcome: 'aborted',
+            // reason 保持 declarations-file-unreadable（既有契约/冒烟断言），另给可判别的 code：
+            // 三条所有权敏感路径统一用 'domains-unreadable' 这个判别词（F-04）。
+            reason: 'declarations-file-unreadable',
+            code: 'domains-unreadable',
+            error: claimed.error,
+            file: config.domainsFile,
+            hint:
+              '域名册读不懂，不做所有权判断：声明文件已存在但读不懂，为避免覆盖别人的声明，本次没有写入任何文件。' +
+              '请人工修好 ' + config.domainsFile + '（文件不存在＝正常空册，不会被这条拦住）。',
+            self,
+          }
+        }
+        return {
+          action: 'claim',
+          outcome: 'write-failed',
+          key,
+          wrote: false,
+          file: config.domainsFile,
+          reason: claimed.reason,
+          error: claimed.error,
+          self,
+          ...(claimed.reason === 'stale-book'
+            ? { hint: '域名册在你这次读与写之间被别人改过两次，本次没有覆盖它。重试一次即可（会基于最新内容重新判断）。' }
+            : {}),
+        }
+      }
+
+      const claimedValue = claimed.value && typeof claimed.value === 'object' ? claimed.value : {}
+
+      // Conflict: somebody else holds it and force was not requested.
+      if (claimedValue.status === 'conflict') {
+        return {
+          action: 'claim',
+          outcome: 'conflict',
+          conflict: true,
+          key,
+          wrote: false,
+          file: config.domainsFile,
+          holder: claimedValue.holder || null,
+          self,
+          hint:
+            '该域已有在任负责人，本次没有覆盖任何东西。要换人：加 force=true 强制交接（旧负责人会写进 note 留痕），或先让在任方自己 release_domain。',
+        }
+      }
+
+      // Idempotent refresh: the same session claiming again just refreshes the on-duty clock.
+      if (claimedValue.status === 'refreshed') {
+        // ── v0.4.0/v0.4.2：刷新在岗时间**不动**政策轴；该域仍有任一级按着就如实提示（未暂停＝空对象）。
+        let pause = {}
+        let pauseError = null
+        try {
+          pause = pausedNoticeOf(config, key, loadDeclarations(config.domainsFile))
+        } catch (error) {
+          pauseError = messageOf(error)
+        }
+        return {
+          action: 'claim',
+          outcome: 'refreshed',
+          key,
+          owner: claimedValue.owner,
+          wrote: true,
+          bytes: claimed.bytes,
+          file: config.domainsFile,
+          ...pause,
+          ...(pauseError ? { pauseError } : {}),
+          self,
+          hint:
+            '该域本来就是你在任，已刷新在岗起算时间（幂等，不算冲突）。' +
+            (pause.pausedNotice ? pause.pausedNotice + pause.pausedHint : '') +
+            (pauseError ? `（另：读取暂停状态失败 ${pauseError}，不影响这次刷新。）` : ''),
+        }
+      }
+
+      // Written: a brand new claim or a force handover. Side effects start here (lock already released).
+      if (claimedValue.status !== 'written') {
+        return {
+          action: 'claim',
+          outcome: 'write-failed',
+          key,
+          wrote: false,
+          file: config.domainsFile,
+          reason: 'unexpected-decision',
+          error: `认领分支没有给出可写入的记录（status=${String(claimedValue.status)}），本次按未写入回报。`,
+          self,
+        }
+      }
+      const handoverFrom = claimedValue.handoverFrom || null
+      let owner = claimedValue.owner
+      // 写之后的收尾（改标题 / 停机通知 / note 留痕）一律**不再抛**：声明已经落盘，
+      // 收尾出错只能如实回报，绝不能让一次成功的认领变成宿主眼里的"工具调用失败"。
+      let retired = null
+      let standDown = null
+      let sideEffectsError = null
+      try {
         // ── v0.3.3: 交接时给**前任**的标题标「（已退役）」——但它多半已经离线；离线只如实回报，
         // 绝不为了改个标题去唤醒一个会话。
-        const retired = handoverFrom ? markRetired(ctx, handoverFrom, 'handover') : null
+        retired = handoverFrom ? markRetired(ctx, handoverFrom, 'handover') : null
         // ── v0.3.6 F2: **强制交接**（接手别人的域）时给前任发一条停机通知。
         // 在线 ⇒ inject（只塞上下文、不唤醒、不跑模型、零成本）；离线/送达失败 ⇒ 往（新声明的）
         // note **追加**一行留痕。声明册**先写**再通知：前任看到「谁接手」时新负责人已经在册。
         // v0.4.1：这条通知**故意不走** send_to_domain 的「已暂停」拦截——前任可能正握着被暂停的域
         // 在改文件，停机通知是**止损**（理由全文见 notifyPredecessor 的 JSDoc）。
-        let standDown = null
         if (handoverFrom) {
           standDown = notifyPredecessor(ctx, {
             predecessorSessionId: handoverFrom,
@@ -846,6 +1079,7 @@ export function buildClaimTool(ctx, config) {
           })
           if (standDown.delivered !== 'inject') {
             const line = standDownNoteLine(standDown)
+            // appendNoteLine 自己会取锁；此处**不在**任何锁里（updateDeclarations 已经返回）。
             const appended = appendNoteLine(config.domainsFile, key, line)
             standDown.noteAppended = appended.ok
             if (appended.ok) {
@@ -861,53 +1095,57 @@ export function buildClaimTool(ctx, config) {
               `${standDown.noteAppended ? '，已写进新声明 note 留痕' : ''}`,
           )
         }
-        const handoverLine = handoverFrom
-          ? '已强制交接：旧负责人 ' + handoverFrom + ' 已写进 note 留痕。'
-          : '已认领该域：从现在起你是在任负责人（同人重复认领＝刷新在岗起算时间）。'
-        const standDownLine = standDown
-          ? standDown.delivered === 'inject'
-            ? `已给前任 ${handoverFrom} 发**停机通知**（inject：只塞上下文、不唤醒、不跑模型、零成本），让它别再改这个域。`
-            : standDown.delivered === 'note-only'
-              ? `前任 ${handoverFrom} 当前不在线（默认不叫醒它）：停机通知只写进了新声明的 note 留痕，建议人工确认它已停手。`
-              : `⚠️ 给前任 ${handoverFrom} 发停机通知失败（${standDown.reason}）：已把这次交接写进新声明的 note 留痕。`
-          : ''
-        const retiredLine = retired
-          ? retired.ok
-            ? '前任标题已标为「' + retired.title + '」。'
-            : '前任标题没标成「（已退役）」（' +
-              retired.reason +
-              (retired.reason === 'not-live' ? '：它已离线，不为了改标题唤醒它' : '') +
-              '）。'
-          : ''
-        // ── v0.4.0：交接/新认领**不动**政策轴。该域仍处已暂停就如实提示（未暂停＝空对象，
-        // 一个键都不多 ⇒ 与 v0.3.6 逐字一致）。
-        const pause = pausedNoticeOf(config, key, loadDeclarations(config.domainsFile))
-        const pauseLine = pause.pausedNotice ? pause.pausedNotice + pause.pausedHint : ''
-        return {
-          action: 'claim',
-          outcome: handoverFrom ? 'handover' : 'created',
-          key,
-          owner,
-          handoverFrom,
-          wrote: true,
-          bytes: result.bytes,
-          file: config.domainsFile,
-          retired,
-          ...(standDown ? { standDown } : {}),
-          ...pause,
-          self,
-          hint: handoverLine + standDownLine + retiredLine + pauseLine,
-        }
       } catch (error) {
-        return {
-          action: 'claim',
-          outcome: 'write-failed',
-          key,
-          wrote: false,
-          file: config.domainsFile,
-          error: error?.message || String(error),
-          self,
-        }
+        sideEffectsError = messageOf(error)
+      }
+      const handoverLine = handoverFrom
+        ? '已强制交接：旧负责人 ' + handoverFrom + ' 已写进 note 留痕。'
+        : '已认领该域：从现在起你是在任负责人（同人重复认领＝刷新在岗起算时间）。'
+      const standDownLine = standDown
+        ? standDown.delivered === 'inject'
+          ? `已给前任 ${handoverFrom} 发**停机通知**（inject：只塞上下文、不唤醒、不跑模型、零成本），让它别再改这个域。`
+          : standDown.delivered === 'note-only'
+            ? `前任 ${handoverFrom} 当前不在线（默认不叫醒它）：停机通知只写进了新声明的 note 留痕，建议人工确认它已停手。`
+            : `⚠️ 给前任 ${handoverFrom} 发停机通知失败（${standDown.reason}）：已把这次交接写进新声明的 note 留痕。`
+        : ''
+      const retiredLine = retired
+        ? retired.ok
+          ? '前任标题已标为「' + retired.title + '」。'
+          : '前任标题没标成「（已退役）」（' +
+            retired.reason +
+            (retired.reason === 'not-live' ? '：它已离线，不为了改标题唤醒它' : '') +
+            '）。'
+        : ''
+      // ── v0.4.0：交接/新认领**不动**政策轴。该域仍处已暂停就如实提示（未暂停＝空对象，
+      // 一个键都不多 ⇒ 与 v0.3.6 逐字一致）。
+      let pause = {}
+      let pauseError = null
+      try {
+        pause = pausedNoticeOf(config, key, loadDeclarations(config.domainsFile))
+      } catch (error) {
+        pauseError = messageOf(error)
+      }
+      const pauseLine = pause.pausedNotice ? pause.pausedNotice + pause.pausedHint : ''
+      const sideEffectLine = sideEffectsError
+        ? `⚠️ 声明本身已写入；但交接后的收尾动作出错（${sideEffectsError}），请人工核对前任是否已停手。`
+        : ''
+      const pauseErrorLine = pauseError ? `（另：读取暂停状态失败 ${pauseError}，不影响这次认领。）` : ''
+      return {
+        action: 'claim',
+        outcome: handoverFrom ? 'handover' : 'created',
+        key,
+        owner,
+        handoverFrom,
+        wrote: true,
+        bytes: claimed.bytes,
+        file: config.domainsFile,
+        retired,
+        ...(standDown ? { standDown } : {}),
+        ...(sideEffectsError ? { sideEffectsError } : {}),
+        ...pause,
+        ...(pauseError ? { pauseError } : {}),
+        self,
+        hint: handoverLine + standDownLine + retiredLine + pauseLine + sideEffectLine + pauseErrorLine,
       }
     },
   )
@@ -934,40 +1172,72 @@ export function buildReleaseTool(ctx, config) {
       const split = splitDomainTarget(raw, null)
       if (split.error) return { action: 'release', outcome: 'invalid', reason: split.error, self }
 
-      const read = readDeclarationsForWrite(config.domainsFile)
-      if (read.parseError) {
+      // F-03：读、身份匹配、删、写全在**同一次**锁里；锁外只做退役/墓碑这类副作用。
+      // 约定：回调里只改内存 doc，绝不调 writeDeclarationsAtomic()（会自己等自己）。
+      const released = updateDeclarations(config.domainsFile, (doc) => {
+        const keys = Object.keys(doc.owners)
+        let matches = []
+        if (raw.includes(':')) {
+          const hit = keys.find((key) => key.toLowerCase() === String(split.key).toLowerCase())
+          if (hit) matches = [hit]
+        } else {
+          const wanted = split.domain.toLowerCase()
+          matches = keys.filter((key) => {
+            const record = doc.owners[key] || {}
+            const short = String(
+              record.domain !== undefined && record.domain !== null && record.domain !== ''
+                ? record.domain
+                : key.split(':').slice(1).join(':'),
+            ).toLowerCase()
+            return short === wanted
+          })
+        }
+
+        if (matches.length === 0) return { write: false, value: { status: 'absent' } }
+
+        const mine = matches.filter((key) => doc.owners[key] && doc.owners[key].sessionId === self.id)
+        if (mine.length === 0) {
+          return {
+            write: false,
+            value: { status: 'not-owner', holders: matches.map((key) => ({ key, ...(doc.owners[key] || {}) })) },
+          }
+        }
+        if (mine.length > 1) return { write: false, value: { status: 'ambiguous', keys: mine } }
+
+        const key = mine[0]
+        const removed = doc.owners[key] || {}
+        delete doc.owners[key]
+        return { write: true, value: { status: 'released', key, removed } }
+      })
+
+      if (!released.ok) {
+        if (released.reason === 'declarations-file-unreadable') {
+          return {
+            action: 'release',
+            outcome: 'aborted',
+            reason: 'declarations-file-unreadable',
+            error: released.error,
+            file: config.domainsFile,
+            hint: '声明文件已存在但读不懂，为避免误删，本次没有写入任何文件。',
+            self,
+          }
+        }
         return {
           action: 'release',
-          outcome: 'aborted',
-          reason: 'declarations-file-unreadable',
-          error: read.parseError,
+          outcome: 'write-failed',
+          wrote: false,
           file: config.domainsFile,
-          hint: '声明文件已存在但读不懂，为避免误删，本次没有写入任何文件。',
+          reason: released.reason,
+          error: released.error,
           self,
+          ...(released.reason === 'stale-book'
+            ? { hint: '域名册在你这次读与写之间被别人改过两次，本次没有删任何东西。重试一次即可（会基于最新内容重新判断）。' }
+            : {}),
         }
       }
-      const data = read.data
-      const keys = Object.keys(data.owners)
-      let matches = []
-      if (raw.includes(':')) {
-        const hit = keys.find((key) => key.toLowerCase() === String(split.key).toLowerCase())
-        if (hit) matches = [hit]
-      } else {
-        const wanted = split.domain.toLowerCase()
-        matches = keys.filter((key) => {
-          const record = data.owners[key] || {}
-          const short = String(
-            record.domain !== undefined && record.domain !== null && record.domain !== ''
-              ? record.domain
-              : key.split(':').slice(1).join(':'),
-          ).toLowerCase()
-          return short === wanted
-        })
-      }
 
-      const holderList = () => matches.map((key) => ({ key, ...(data.owners[key] || {}) }))
-
-      if (matches.length === 0) {
+      const releasedValue = released.value && typeof released.value === 'object' ? released.value : {}
+      if (releasedValue.status === 'absent') {
         return {
           action: 'release',
           outcome: 'absent',
@@ -978,36 +1248,44 @@ export function buildReleaseTool(ctx, config) {
           hint: '本来就没有这个在任声明，无需释放。',
         }
       }
-
-      const mine = matches.filter((key) => data.owners[key] && data.owners[key].sessionId === self.id)
-      if (mine.length === 0) {
+      if (releasedValue.status === 'not-owner') {
         return {
           action: 'release',
           outcome: 'not-owner',
           wrote: false,
           file: config.domainsFile,
-          holders: holderList(),
+          holders: releasedValue.holders || [],
           self,
           hint: '该域不是你在任，只有负责人本人能释放。换人请用 claim_domain(force:true) 交接。',
         }
       }
-      if (mine.length > 1) {
+      if (releasedValue.status === 'ambiguous') {
         return {
           action: 'release',
           outcome: 'ambiguous-own-declarations',
           wrote: false,
           file: config.domainsFile,
-          keys: mine,
+          keys: releasedValue.keys || [],
           self,
           hint: '你同时持有多个同名声明，请用「项目:域」完整写法指定要释放哪一个（本次没有写入任何文件）。',
         }
       }
 
-      const key = mine[0]
-      const removed = data.owners[key] || {}
-      delete data.owners[key]
+      if (releasedValue.status !== 'released') {
+        return {
+          action: 'release',
+          outcome: 'write-failed',
+          wrote: false,
+          file: config.domainsFile,
+          reason: 'unexpected-decision',
+          error: `释放分支没有给出可删除的记录（status=${String(releasedValue.status)}），本次按未写入回报。`,
+          self,
+        }
+      }
+
+      const key = releasedValue.key
+      const removed = releasedValue.removed || {}
       try {
-        const result = writeDeclarationsAtomic(config.domainsFile, data)
         // ── v0.3.3: 退役即改标题。正在执行本工具 ⇒ 调用方会话必然 live；拿不到它的 Session 对象
         // 就如实回报（绝不为了改个标题去唤醒/重建一个会话）。
         const retired = markRetired(ctx, exec?.agent, 'release')
@@ -1092,7 +1370,7 @@ export function buildReleaseTool(ctx, config) {
           queue: { file: queue.file, pending: queue.pending, total: queue.total, delivered: queue.records.filter((r) => r.status === INBOX_DELIVERED).length },
           removedSessionId: removed.sessionId ?? null,
           wrote: true,
-          bytes: result.bytes,
+          bytes: released.bytes,
           file: config.domainsFile,
           noteEcho: userNote || null,
           noteNotPersisted: userNote ? true : false,

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildMenuOptions, runMenuChoice } from '../lib/core/menu.js'
+import { buildMenuOptions, runMenuChoice, registerMenuRoutes } from '../lib/core/menu.js'
 import { upsertRegistration } from '../lib/core/registrations.js'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-menu-'))
@@ -140,6 +140,96 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(sys.confirmation && sys.confirmation.confirmLabel, '接手仍要带确认浮层')
   const proj = out.options.find((o) => o.id.startsWith('project'))
   ok(!proj.id.includes('takeover'), '项目层没人占时不该带 takeover')
+}
+
+// 11. F-11 / F-12：真跑 registerMenuRoutes 注册的 handler —— Host 闸（IPv6 本机）与请求体上限
+{
+  const routes = new Map()
+  const fakeServer = {
+    register(route) {
+      routes.set(route.path, route.handler)
+      return () => routes.delete(route.path)
+    },
+  }
+  const routeCtx = {
+    get(name) {
+      if (name === 'webServer') return fakeServer
+      if (name === 'agents') return { get: () => null }
+      return undefined
+    },
+  }
+  const dispose = registerMenuRoutes(routeCtx, deps)
+  ok(typeof dispose === 'function', 'registerMenuRoutes 应返回 disposer')
+  ok(routes.has('/api/dsh-domain-bridge/menu') && routes.has('/api/dsh-domain-bridge/run'), '菜单路由应挂上 menu/run')
+
+  const makeReq = (host, chunks) => {
+    const handlers = {}
+    const req = {
+      headers: { host },
+      url: '/',
+      on(event, fn) {
+        handlers[event] = fn
+        return req
+      },
+    }
+    // 像真的流一样：订阅完成后才吐数据。
+    setTimeout(() => {
+      for (const chunk of chunks) handlers.data?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8'))
+      handlers.end?.()
+    }, 0)
+    return req
+  }
+  const makeRes = () => {
+    const res = { status: null, body: '' }
+    res.writeHead = (status) => {
+      res.status = status
+    }
+    res.end = (body) => {
+      res.body = String(body ?? '')
+    }
+    return res
+  }
+  const post = async (path, host, bodyText) => {
+    const res = makeRes()
+    await routes.get(path)(makeReq(host, [bodyText]), res)
+    return res
+  }
+
+  const small = JSON.stringify({ command: 'pause', sessionId })
+  for (const host of ['127.0.0.1:8652', 'localhost:8652', '[::1]:8652', '[::1]']) {
+    const res = await post('/api/dsh-domain-bridge/menu', host, small)
+    ok(res.status === 200, `F-11：本机 Host「${host}」应放行（实际 ${res.status}）`)
+  }
+  for (const host of ['evil.example:8652', '192.168.1.5:8652', 'localhost.attacker.example:8652', '']) {
+    const res = await post('/api/dsh-domain-bridge/menu', host, small)
+    ok(res.status === 403, `F-11：非本机 Host「${host}」必须拒绝（实际 ${res.status}）`)
+  }
+
+  const big = JSON.stringify({ command: 'pause', sessionId, pad: 'x'.repeat(70000) })
+  const tooLarge = await post('/api/dsh-domain-bridge/menu', '127.0.0.1:8652', big)
+  ok(tooLarge.status === 413, `F-12：>64KB 请求体应回 413（实际 ${tooLarge.status}）`)
+  let rejected = null
+  try {
+    rejected = JSON.parse(tooLarge.body)
+  } catch {
+    rejected = null
+  }
+  ok(
+    rejected && rejected.ok === false && rejected.reason === 'body-too-large',
+    'F-12：应明确回 ok:false + reason:body-too-large',
+  )
+  ok(!String(tooLarge.body).includes('unknown-command'), 'F-12：不能把截断内容当命令解析成「未知命令」')
+
+  const runTooLarge = await post('/api/dsh-domain-bridge/run', '127.0.0.1:8652', big)
+  ok(runTooLarge.status === 413, '/run 也必须回 413（三条读 body 的路由同一口径）')
+
+  // 正常大小的请求体不受影响（别把上限做成"一律拒绝"）。
+  const nearLimit = JSON.stringify({ command: 'pause', sessionId, pad: '' })
+  const nearRes = await post('/api/dsh-domain-bridge/menu', '127.0.0.1:8652', nearLimit)
+  ok(nearRes.status === 200, '正常大小的请求体不受影响')
+
+  dispose()
+  ok(!routes.has('/api/dsh-domain-bridge/menu'), 'disposer 应摘掉路由')
 }
 
 console.log(`[menu] 用例 ${passed} 条全部通过`)

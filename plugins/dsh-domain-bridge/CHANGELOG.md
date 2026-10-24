@@ -3,6 +3,37 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.12] — 2026-10-24
+
+**P2 批次：域名册读改写进锁、HTTP 输入边界、`/state` 口径对齐。**
+
+### 一、域名册「读-改-写」整段进锁（F-03 / F-19，P1）
+
+原来 `claim_domain` / `release_domain` / `declareNewOwner` **先读册、再在锁里写**：两进程各读旧本，后写覆盖先写（实测两进程各认领一个域，**5/5 轮只剩 1 条**，两边都回 ok）。
+
+新增 `updateDeclarations()`：读取 + 判断 + 写入**在同一次** `withDomainsLock` 里完成，落盘走不自取锁的 `writeDeclarationsUnlocked()`（`writeDeclarationsAtomic()` 保留给锁外调用）。`claim_domain` / `release_domain` / `declareNewOwner` / `appendNoteLine` 全部改走它。
+
+写入前比对内容版本（raw 的 sha1）：不一致 ⇒ 锁内重读重跑一次；仍不一致 ⇒ `reason:'stale-book'`，**一个字不写**。锁不可重入，回调里只做「读 / 改内存 / 比版本 / 写文件」，不再取任何锁；`appendNoteLine` 的停机通知在锁释放后独立取锁（不是嵌套）。
+
+**效果**：同一探针修前 0/5、修后 **5/5**（两个键都在、failed 0/0）；30 秒双进程压测 23,093 轮无挂起、无丢键（仅 2 轮因争用回 `locked`，写前拒绝、无丢数据）。
+
+### 二、HTTP 输入边界（F-11 / F-12）
+
+- `localOnly` 放行 `[::1]` / `[::1]:port`（此前 IPv6 本机被误拒 403）。
+- `readBody` 超过 65,536 字节立即停读并丢弃，`/menu`、`/run`、`/handoff-wizard/run` 统一回 **413** + `reason:'body-too-large'`；不再把截断后的内容当合法输入（以前会回"未知命令"）。
+
+### 三、`/state` 口径对齐（F-08 / F-09 / F-10）
+
+- 坏队列行 / 读不动的文件**并入 `warnings`**，并说明 `pending` 只数能读的行（以前静默丢）。
+- 会话行的暂停状态改为**四级 OR**（session / project / 持有域 / global，与 `list_domain_*` 同一套判定），新增 `pausedScopes` / `pausedByScopes` / `pausedDomains`；`pausedAt/By/Note` 优先 session 级记录。**行为变化**：持有「被暂停的域」的会话现在也会显示已暂停（held-domain ≠ 被禁言，与既有口径一致）。
+- `reads.stateDir` 改为**真实解析出来的目录**（与读盘用的同一个值），解析不到就省略字段，不再恒为 `null`。
+
+### 四、测试
+
+- **610 用例**（577 → 610，新增 33：registrations 13→15、menu 51→67、state 28→43），`node test/run-all.mjs` 连续 4 轮 8/8。
+- smoke 290 / 56,934 分支断言；真实 state 11 文件 + `domains.json` 前后 SHA-256 一致，无 `.tmp`/`.lock` 残留。
+- 文档：`docs/06-limitations.md` 新增 C2「按单实例设计」；D1 更新为「`npm test` 已跑全量、基线 610 用例」。
+
 ## [0.8.11] — 2026-10-24
 
 **交接瘦身（卡＋短模板＋brief）＋ 并发 drain 去重。**
