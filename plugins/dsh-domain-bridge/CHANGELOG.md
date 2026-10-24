@@ -3,6 +3,44 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.10] — 2026-10-24
+
+**交接面板进应用内（不再开浏览器页）＋ 两处写盘丢数据修掉 ＋ 域名册读不懂时不再放行。**
+
+### 一、`/handoff` 的「逐项设置参数」改成应用内多级面板（改）
+
+宿主 `popupSelect` 选中必定关闭（`settle()` → consume → CLOSED → 回焦输入框），没有子菜单/keep-open/程序化开启 —— 真多级做不到。改法：`commandUi.decorate('handoff', { ui: { kind:'action', run() } })` 吃掉 token 后，由客户端把面板渲染进根级 `shell.overlay`（`lib/client.js` 131 → 1157 行）。
+
+- 五段手风琴（身份 / 模式 / 模型 / 权限档 / 标题与开工任务），顶部搜索过滤，选完自动收起并更新摘要；底部「创建接任会话」。
+- 数据/提交仍走现成后端：`POST /handoff-wizard/data?sessionId=…` 与 `POST /handoff-wizard/run`（字段逐个对照 `lib/core/wizard.js` 的页面提交）。
+- 旧 `openHandoffWizard()` 保留为兜底：面板右上「旧版网页设置 ↗」，覆盖层不可用或 600ms 内宿主没挂上时自动退回开网页。
+- **默认开工任务换成 288 字短模板**：核身份 → 只读 PROJECT.md 两条各前 3 条 → 回报三行 → **本轮不改任何文件、不开工**（实测没有禁令的换届首轮 66 步 / 585s，有禁令的 3~11 步）。
+
+### 二、暂停状态与队列写盘改原子（修，P1 丢数据）
+
+`pause.js` / `messaging.js` 原先用固定名 `<file>.tmp` + 单次 rename、无锁 ⇒ 跨进程并发实测写失败 26 次、静默覆盖 19 次。改为复用 `registrations.js` 的 `writeAtomicUnique`（唯一名 tmp + rename 重试 10×10ms + finally 自清）。
+
+### 三、「读-改-写」整段加按文件粒度的跨进程锁（修，P1 丢更新）
+
+写原子不够：`updateInboxStatus` 先 load 全量快照再整文件重写、`set_domain_state` 读旧记录再合并，两进程各拿旧快照 ⇒ 后写覆盖先写（队列 40 条只成 31）。现在两段的 load→改→写整段包进 `<file>.lock`（复用 `withDomainsLock`，在 `messaging.js` 导出为 `withFileLock`）；三个临界区只做 fs、不再取锁，无嵌套。实测队列 40/40、三进程 60/60、暂停无撕裂记录。
+
+### 四、域名册读不懂时 fail-closed（修，P1 安全）
+
+原先把"册子坏 JSON"折成"没人认领"：`send` 会按索引标注照投、`create` 会再开一条活会话，回执还不提。现在 `claim_domain`（含 force）/ `create_domain_session` 的 F1 闸 / `send_to_domain` 的声明优先解析三处一律拒绝并带 `code:'domains-unreadable'`；`dryRun` 也如实拒绝。**文件不存在＝正常空册，不误伤**；`list_*` 与 `/state` 仍只显示错误不抛。
+
+### 五、菜单「强制暂停项目/全局」真能用（修）
+
+菜单项把 `--confirm` 塞进了第一步，待确认记录从未写入 ⇒ 永远回"没有待确认的强制暂停"。改成一次点选＝先写 pending、紧接着带 `--confirm` 执行，两段回执一起带回；`/pause-all` 也真检查暂停结果，失败回 `kind:'error'`（**行为变化**：以前恒 success）。
+
+### 六、测试与仓库
+
+- 新增 `test/run-all.mjs`：一条命令串起 8 个套件（每套独立临时 `DSH_DOMAIN_BRIDGE_HOME`）；`npm test` 不再只跑 smoke。
+- 补齐仓库缺失的 `lib/core/state.js` 与 `test/state.test.mjs`（此前只在部署副本，照仓库发版会丢掉 `/state`）。
+- 两个过期夹具改成与实现无关：smoke 的"写不进去"改成目标文件只读；wizard 的客户端契约断言改成面板（decorate + action + shell.overlay + 兜底）。
+- `.gitignore` 补 `*.lock` / `*.tmp`。
+
+**测试**：8/8 套件、532 条用例（smoke 284 / 55,563 分支断言、commands 88、menu 51、wizard 37、state 28、bootstrap 16、lifecycle 15、registrations 13/175）全绿。
+
 ## [0.8.9] — 2026-10-22
 
 **两个 bug：点「逐项设置参数」什么都不出；接任会话标题丢了时间戳。**
