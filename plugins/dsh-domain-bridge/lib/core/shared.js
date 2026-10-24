@@ -11,7 +11,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 
 export const PLUGIN = 'dsh-domain-bridge'
-export const VERSION = '0.8.15'
+export const VERSION = '0.8.16'
 /**
  * v0.3.6 审计 traceId（项目规则 vibe-audit-logger-lite）：本次三处行为日志共用它，
  * 完整故事线落在 projectlog/2026-10-12-域桥v0.3.6-F1F2F4交接防混乱.md。

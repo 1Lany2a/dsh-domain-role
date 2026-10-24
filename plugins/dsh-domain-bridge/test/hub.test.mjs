@@ -31,16 +31,18 @@ function fakeRes() {
 const LOCAL = { headers: { host: '127.0.0.1:3048' }, method: 'GET' }
 const remote = (host) => ({ headers: { host }, method: 'GET' })
 
-// 1. 白名单：只认那六个名字，别的一律 null（目录穿越在结构上不可能）
+// 1. 白名单：只认那七个名字，别的一律 null（目录穿越在结构上不可能）
 {
-  for (const name of ['hub', 'network', 'topology', 'space.data.js', 'space.json', 'state.json']) {
+  for (const name of ['hub', 'network', 'topology', 'space.data.js', 'space.json', 'state.json', 'v9-tokens.css']) {
     ok(hubFileDef(name) !== null, `${name} 应在白名单里`)
   }
-  for (const name of ['', '../hub.html', 'hub/../secret', 'hub.html', 'HUB', null]) {
+  for (const name of ['', '../hub.html', 'hub/../secret', 'hub.html', 'HUB', null, 'style.css']) {
     ok(hubFileDef(name) === null, `${String(name)} 不该在白名单里`)
   }
   ok(hubFileDef('hub').type.startsWith('text/html'), 'hub 的 content-type 应是 html')
   ok(hubFileDef('space.json').type.startsWith('application/json'), 'space.json 的 content-type 应是 json')
+  // 严格 MIME：rel=stylesheet 发错类型会被浏览器整份丢掉（实测 cssRules=0）
+  ok(hubFileDef('v9-tokens.css').type.startsWith('text/css'), 'v9-tokens.css 必须是 text/css')
 }
 
 // 2. 目录优先级：显式 spaceDir > <home>/space > ''（拿不到就不猜路径）
@@ -53,7 +55,7 @@ const remote = (host) => ({ headers: { host }, method: 'GET' })
 // 3. 路由表：6 条 exact，路径固定（不接子路径）
 {
   const routes = hubRouteDefs({ spaceDir: path.join(root, 'empty') })
-  ok(routes.length === 6, `应有 6 条路由（实际 ${routes.length}）`)
+  ok(routes.length === 7, `应有 7 条路由（实际 ${routes.length}）`)
   ok(
     routes.every((route) => route.kind === 'exact' && typeof route.handler === 'function'),
     '每条都必须 exact + 有 handler',
@@ -103,6 +105,12 @@ const routeOf = (name) => routes.find((route) => route.path.endsWith(name === 'h
   const json = fakeRes()
   await routeOf('space.json').handler({ ...LOCAL }, json)
   ok(String(json.out.headers['content-type']).includes('application/json'), 'space.json 应是 json')
+
+  fs.writeFileSync(path.join(dir, 'v9-tokens.css'), ':root{--accent:#6ea79a}', 'utf8')
+  const css = fakeRes()
+  await routeOf('v9-tokens.css').handler({ ...LOCAL }, css)
+  ok(css.out.status === 200, 'v9-tokens.css 应能发出')
+  ok(String(css.out.headers['content-type']).startsWith('text/css'), 'v9-tokens.css 的 content-type 必须是 text/css')
 }
 
 // 6. 本机限制 + 方法限制：跨站 / 非本机 / 非 GET 都不给文件
@@ -129,7 +137,7 @@ const routeOf = (name) => routes.find((route) => route.path.endsWith(name === 'h
     get: (name) => (name === 'webServer' ? { register: (route) => (registered.push(route), () => {}) } : undefined),
   }
   const dispose2 = registerHubRoutes(ctx, { spaceDir: dir })
-  ok(registered.length === 6, `应注册 6 条路由（实际 ${registered.length}）`)
+  ok(registered.length === 7, `应注册 7 条路由（实际 ${registered.length}）`)
   dispose2()
   ok(true, 'disposer 可调用且不抛')
 }

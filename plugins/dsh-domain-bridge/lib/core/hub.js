@@ -26,6 +26,10 @@ const HUB_FILES = {
   'space.data.js': { file: 'space.data.js', type: 'text/javascript; charset=utf-8' },
   'space.json': { file: 'space.json', type: 'application/json; charset=utf-8' },
   'state.json': { file: 'state.json', type: 'application/json; charset=utf-8' },
+  // v0.8.16：GUI 共用的视觉资产（v9 token / 卡片皮肤）外置成一份 CSS。
+  // 必须按 text/css 发：浏览器对 `rel=stylesheet` 的响应做严格 MIME 检查，
+  // 发成 application/octet-stream 会**整份样式被丢掉**（实测 cssRules=0，页面看着"没穿衣服"）。
+  'v9-tokens.css': { file: 'v9-tokens.css', type: 'text/css; charset=utf-8' },
 }
 
 /** 白名单查表（导出给测试用；未知名字 ⇒ null）。 */

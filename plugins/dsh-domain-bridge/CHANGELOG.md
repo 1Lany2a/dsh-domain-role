@@ -3,6 +3,22 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.16] — 2026-10-24
+
+**工作台资源白名单加第 7 个：`v9-tokens.css`（GUI 视觉资产外置）。**
+
+背景：GUI 域把 v9 的 token 与卡片/槽位/按钮皮肤抽成一份 `v9-tokens.css`，network/topology 用 `<link rel=stylesheet>` 引；插件原先 6 条白名单里没有它 ⇒ 页面"没穿衣服"。
+
+落地：`HUB_FILES` 加 `v9-tokens.css → text/css; charset=utf-8`，路由 `/api/dsh-domain-bridge/hub/view/v9-tokens.css`。
+
+**为什么类型必须对**：浏览器对 `rel=stylesheet` 做严格 MIME 检查——发成 `application/octet-stream` 会**整份样式被丢弃**（实测 `cssRules=0`，不是 404 却等于没样式）。这一条写进 README，免得下次换静态服务器再踩。
+
+**真机硬约束（同批写进 README）**：侧栏面板可能是 **`blob:dsh-app://app/…` 文档**（宿主沙箱化）——blob 没有可用 base，页面里所有 URL 必须用 `location.origin` 拼**绝对地址**，否则 `fetch('/api/…')` 在解析阶段就抛 `Failed to parse URL from /api/…`（2026-10-24 真机实测）。
+
+测试：hub 套件 +2 条（白名单含 css、`text/css` 断言），路由数 6 → 7；**9/9 套件 · 671 用例 · smoke 301 / 59,101** 全绿。
+
+⚠️ host 侧改动，**需重启 dsh 才生效**。
+
 ## [0.8.15] — 2026-10-24
 
 **会话工作台（hub）上线：侧栏多一个「体系」入口，左会话管理 + 右协作空间并列，可从空间进拓扑与三维网络。**
