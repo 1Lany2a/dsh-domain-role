@@ -36,6 +36,7 @@ import { buildListModelsTool, buildSetModelTool, buildSetDefaultModelTool, build
 import { runInitialize } from './core/bootstrap.js'
 import { buildCommandDefs, registerCommandDefinitions } from './core/commands.js'
 import { registerMenuRoutes } from './core/menu.js'
+import { registerHubRoutes } from './core/hub.js'
 
 export * from './core/shared.js'
 export * from './core/tools.js'
@@ -47,6 +48,7 @@ export * from './core/registrations.js'
 export * from './core/bootstrap.js'
 export * from './core/commands.js'
 export * from './core/menu.js'
+export * from './core/hub.js'
 
 export default {
   name: 'domain-bridge',
@@ -83,6 +85,9 @@ export default {
         // 运行期数据不写进插件包目录，也不写进项目的 _registry 树）。写成 !== undefined 而不是 ||，
         // 这样配置里显式写 '' 才会退回默认值。
         stateDir: rawConfig && rawConfig.stateDir !== undefined ? rawConfig.stateDir : '',
+        // v0.8.15：会话工作台（hub / 拓扑 / 三维网络）的静态资源目录。缺省 `<home>/space`；
+        // GUI 本体由 GUI 域独立维护（纯 HTML/CSS/JS），插件只按白名单把文件发出去（见 core/hub.js）。
+        spaceDir: rawConfig && rawConfig.spaceDir !== undefined ? String(rawConfig.spaceDir) : '',
       }
 
       // v0.7.0: build each definition ONCE, register it, and hand the SAME object to the command
@@ -133,6 +138,14 @@ export default {
           warn('command menu routes registered (/api/dsh-domain-bridge/{health,menu,run})')
         } catch (error) {
           warn(`menu routes failed: ${error?.message || String(error)}`)
+        }
+        // v0.8.15：工作台静态页（白名单 6 个固定路径；文件缺席回诚实的空态，不是 500）。
+        try {
+          const dispose = registerHubRoutes(bridgeCtx, config)
+          if (typeof dispose === 'function') disposers.push(dispose)
+          warn('hub routes registered (/api/dsh-domain-bridge/hub[,/view/*])')
+        } catch (error) {
+          warn(`hub routes failed: ${error?.message || String(error)}`)
         }
         return () => {
           for (const dispose of disposers) {

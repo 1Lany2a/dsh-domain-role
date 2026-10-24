@@ -3,6 +3,26 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.15] — 2026-10-24
+
+**会话工作台（hub）上线：侧栏多一个「体系」入口，左会话管理 + 右协作空间并列，可从空间进拓扑与三维网络。**
+
+### 一、宿主侧：6 条白名单静态路由（`lib/core/hub.js`）
+
+`GET /api/dsh-domain-bridge/hub` → `hub.html`；`/hub/view/{network,topology,space.data.js,space.json,state.json}` → 同名文件。目录＝`config.spaceDir`（缺省 `<home>/space`）。只允许本机（Host 头）、非 GET ⇒ 405、**白名单之外没有路径**（不接子路径，目录穿越在结构上不可能）。`hub.html` 缺席 ⇒ 200 + **可执行空态**（写清放哪、放什么、怎么配），其它缺席 404。
+
+**为什么这么薄**：用户口径「保持轻耦合，因为体系还会变动」——GUI 本体由 GUI 域独立维护（纯 HTML/CSS/JS、只读 HTTP），插件只负责把文件按固定路径发出去。数据面也不进插件：页面自己 `fetch('/state')`（同源）。
+
+### 二、客户端：侧栏入口 + 主区 iframe（`lib/client.js`）
+
+`sidebar.panellist` 注册「体系」入口（图标组件），`main` keyed slot 注册同 id 的页面组件——**只放一个 iframe** 指向 `/hub`。GUI 改版不用动客户端插件。
+
+### 三、验证
+
+新增第 9 个测试套件 `test/hub.test.mjs`（40 条）：白名单查表（六名在内、`../hub.html` 等一律 null）、目录优先级（显式 `spaceDir` > `<home>/space` > 空串）、路由表 6 条 exact、空态页（200 + 点名文件 + no-store）、文件就位时的 content-type、本机限制（evil Host ⇒ 403 / `[::1]` 放行）、非 GET ⇒ 405、没有 webServer 也不抛且回可调用 disposer。**9/9 套件 · 666 用例 · smoke 301 / 59,101 分支断言**全绿。
+
+⚠️ host 侧改动，**需重启 dsh 才生效**（客户端 HMR 不用重启，但路由要）。
+
 ## [0.8.14] — 2026-10-24
 
 **积压看得见、撤得回（体系 `PROJECT.md` 第 60 条）**：新增只读工具 `list_domain_queue`；`withdraw_domain_message` 可省 `id`——只给 `domain` 就撤该队列**最新一条 pending**。

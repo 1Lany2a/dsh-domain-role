@@ -32,6 +32,7 @@ const withSmoke = !flags.has('--no-smoke')
 const ALL_SUITES = [
   'bootstrap.test.mjs',
   'commands.test.mjs',
+  'hub.test.mjs',
   'lifecycle.test.mjs',
   'menu.test.mjs',
   'registrations.test.mjs',

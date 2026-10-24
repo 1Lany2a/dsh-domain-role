@@ -1169,6 +1169,98 @@ body[data-ds-dark-theme] .dbhp-host{--dbhp-r:6px;--dbhp-bg:#161a1c;--dbhp-card:#
             console.warn('[dsh-domain-bridge] 挂载换届面板失败 ⇒ 退回旧版网页设置：', error)
           }
         })
+
+        // v0.8.15：侧栏「体系」入口 + 主区工作台 —— 客户端这一层**只放一个 iframe**，
+        // 页面本体由插件按 `/api/dsh-domain-bridge/hub` 发出去（GUI 域独立维护）。
+        // 这样 GUI 改版不用动客户端插件，插件改内部也不用动页面（用户口径：保持轻耦合）。
+        ctx.inject(['slots'], (hctx) => {
+          const hslots = hctx.get('slots')
+          if (!hslots || typeof hslots.inject !== 'function' || typeof hslots.register !== 'function') {
+            console.warn('[dsh-domain-bridge] slots 服务不可用 ⇒ 不挂工作台面板')
+            return
+          }
+          if (!react || typeof react.createElement !== 'function') {
+            console.warn('[dsh-domain-bridge] React 不可用 ⇒ 不挂工作台面板')
+            return
+          }
+          const HUB_ID = 'domain-bridge-hub'
+
+          function HubIcon(props) {
+            const edge = typeof props?.size === 'number' && props.size > 0 ? props.size : 16
+            return react.createElement(
+              'svg',
+              { width: edge, height: edge, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' },
+              react.createElement('rect', {
+                x: 1.6,
+                y: 2.4,
+                width: 5.2,
+                height: 11.2,
+                rx: 1.5,
+                stroke: 'currentColor',
+                strokeWidth: 1.2,
+              }),
+              react.createElement('rect', {
+                x: 9.2,
+                y: 2.4,
+                width: 5.2,
+                height: 5.2,
+                rx: 1.5,
+                stroke: 'currentColor',
+                strokeWidth: 1.2,
+              }),
+              react.createElement('rect', {
+                x: 9.2,
+                y: 9.2,
+                width: 5.2,
+                height: 4.4,
+                rx: 1.5,
+                stroke: 'currentColor',
+                strokeWidth: 1.2,
+              }),
+            )
+          }
+
+          function HubPage() {
+            const src = `${location.origin}${PREFIX}/hub`
+            return react.createElement(
+              'div',
+              { style: { position: 'relative', width: '100%', height: '100%', minHeight: '100vh' } },
+              react.createElement('iframe', {
+                src,
+                title: '体系工作台（会话管理 + 协作空间）',
+                style: {
+                  position: 'absolute',
+                  inset: '0',
+                  width: '100%',
+                  height: '100%',
+                  border: '0',
+                  display: 'block',
+                  background: 'transparent',
+                },
+              }),
+            )
+          }
+
+          try {
+            hctx.effect(
+              () =>
+                hslots.inject('sidebar.panellist', () =>
+                  hslots.register(
+                    { name: 'sidebar.panellist', id: HUB_ID, order: 40, label: () => '体系' },
+                    HubIcon,
+                  ),
+                ),
+              'domain-bridge: hub panel entry',
+            )
+            hctx.effect(
+              () =>
+                hslots.inject('main', () => hslots.register({ name: 'main', key: HUB_ID }, HubPage)),
+              'domain-bridge: hub page',
+            )
+          } catch (error) {
+            console.warn('[dsh-domain-bridge] 工作台面板挂载失败：', error)
+          }
+        })
       },
     }
   },
