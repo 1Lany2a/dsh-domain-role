@@ -210,7 +210,13 @@ function renderCard({ key, layer, previousSessionId, cwd, generatedAt, status, n
   )
 }
 
-/** 按整卡字节预算逐轮压摘要（先 90 字，压到 24 字；还不够就硬截断兜底）。 */
+/**
+ * 按整卡字节预算逐轮压摘要（先 90 字，压到 24 字；还不够就硬截断兜底）。
+ *
+ * v0.8.13 起硬截断**只切可变的正文**（身份/现状/下一步），不切卡底的固定部分（硬规则 + 交接清单）：
+ * 那两段是"接任者必须看到的东西"，被截掉等于没写。实测真实 PROJECT.md 一版卡已到 2022/2048 B，
+ * 再不保护尾部，下一条待办长一点就会把清单吃掉。
+ */
 function renderWithinBudget(facts) {
   let cap = MAX_ITEM_CHARS
   let markdown = renderCard({ ...facts, cap })
@@ -218,9 +224,20 @@ function renderWithinBudget(facts) {
     cap = Math.max(MIN_ITEM_CHARS, cap - ITEM_SHRINK_STEP)
     markdown = renderCard({ ...facts, cap })
   }
-  const hardTrimmed = byteLengthOf(markdown) > HANDOFF_CARD_MAX_BYTES
-  if (hardTrimmed) markdown = truncateToBytes(markdown, HANDOFF_CARD_MAX_BYTES)
-  return { markdown, itemChars: cap, truncated: hardTrimmed }
+  const overBudget = byteLengthOf(markdown) > HANDOFF_CARD_MAX_BYTES
+  if (overBudget) {
+    const tailMark = '## 第一轮硬规则'
+    const cut = markdown.indexOf(tailMark)
+    if (cut > 0) {
+      const head = markdown.slice(0, cut)
+      const tail = markdown.slice(cut)
+      const room = HANDOFF_CARD_MAX_BYTES - byteLengthOf(tail)
+      markdown = room > 0 ? truncateToBytes(head, room) + tail : truncateToBytes(tail, HANDOFF_CARD_MAX_BYTES)
+    } else {
+      markdown = truncateToBytes(markdown, HANDOFF_CARD_MAX_BYTES)
+    }
+  }
+  return { markdown, itemChars: cap, truncated: overBudget }
 }
 
 /** 落盘（md + json）。`write:false` = 只算不写（dryRun 那种"绝不产生副作用"的演练）。 */

@@ -3,6 +3,32 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.14] — 2026-10-24
+
+**积压看得见、撤得回（体系 `PROJECT.md` 第 60 条）**：新增只读工具 `list_domain_queue`；`withdraw_domain_message` 可省 `id`——只给 `domain` 就撤该队列**最新一条 pending**。
+
+### 一、新增 `list_domain_queue`（只读）
+
+起因：`withdraw_domain_message` 要 `id`，而 `id` 只在"发送被暂停拦下"那一刻的回执里露过面，**丢了就撤不回**；`list_domain_owners` 每行只有 `pending` 计数，看不到是哪几条、谁发的、什么时候。
+
+新工具列出插件落盘队列（`<stateDir>/inbox/<key>.jsonl`）的条目：`id` / `status` / `mode` / `from`（＋短号）/ `queuedAt` / 正文摘要；`status` 取 `pending`（默认）/ `delivering` / `delivered` / `failed` / `withdrawn` / `all`，`domain` 认域短名、`项目:域`、会话 id（短号也行），`mine:true` 只看本会话发的，`limit` 默认 50（上限 200）。另给 `totals`、每个队列一行（`pending` / `total` / `lastAt`）与 `latestId` / `latestMineId`。**只读**：smoke 断言跑前跑后队列文件逐字节不变。
+
+`domain` 参数的解析抽成 `resolveQueueKeyArg()`，与 `withdraw_domain_message` **共用同一套**——两处各写一份，查到的和撤到的就可能不是同一条队列。
+
+### 二、撤回不必再抄 id（`withdraw_domain_message`）
+
+`id` 可省略：只给 `domain` 时撤该队列里**最新一条 pending**（默认仍只认本会话发的，`force:true` 才看别人的；回执带 `pickedLatest:true`）。空队列 ⇒ `not-found`，不假装成功。
+
+### 三、边界（写清楚，不留幻想）
+
+宿主 composer 里显示的「N 条排队消息」**不在插件队列里**——那是宿主自己的队列，插件看不见、也撤不回。本工具只管**插件介导**的落盘队列；对应纪律写进体系根 `templates\dispatch-template.md` 的「域间投递纪律」节。
+
+### 四、验证
+
+smoke 新增第 16 节（11 条断言）：只读性（逐字节）、`status` / `mine` / `domain` 过滤、`latestId` 与 `latestMineId`、免 id 撤最新一条、空队列 `not-found`、非法 `status` ⇒ `bad-status`。**8/8 套件 · 626 用例 · smoke 301 / 59,101 分支断言**全绿（仓库与部署两棵树逐文件 SHA1 一致）。
+
+⚠️ host 侧改动，**需重启 dsh 才生效**。
+
 ## [0.8.13] — 2026-10-24
 
 **交接清单固化（体系 PROJECT.md 第 61 条）：交接卡底部与 `/handoff` 回执各加一段「交接前后流程」。**

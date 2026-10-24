@@ -1,7 +1,7 @@
 /**
  * dsh-domain-bridge smoke test (v0.6.1)
  *
- * What it guards, in one sentence: EVERY reachable branch of ALL 11 tools must return a value the
+ * What it guards, in one sentence: EVERY reachable branch of ALL 12 tools must return a value the
  * host can accept as LOSSLESS JSON - i.e. no `undefined` / function / symbol / bigint / NaN /
  * +-Infinity / -0 / Date / Map / Set / typed array / circular reference anywhere in the tree, and
  * `JSON.parse(JSON.stringify(v))` must deep-equal v.
@@ -13,7 +13,7 @@
  * check below deep-scans every tool result instead of spot-checking keys.
  *
  * Also frozen here (regression): the send_to_domain envelope text + the v4 message shape, the
- * list_domain_sessions top-level key set, the 11 tool names, and VERSION == package.json version.
+ * list_domain_sessions top-level key set, the 12 tool names, and VERSION == package.json version.
  *
  * v0.3.2 adds section 7: the whole workspace-attach + pin ladder of create_domain_session,
  * driven by a FAKE registry and a create() spy -
@@ -100,6 +100,7 @@ const EXPECTED_TOOLS = [
   'claim_domain',
   'create_domain_session',
   'list_domain_owners',
+  'list_domain_queue',
   'list_domain_sessions',
   'list_models',
   'release_domain',
@@ -317,7 +318,7 @@ function mount(options = {}) {
     // v0.6.0: deployment-config layer of `domainSessionModel` (undefined = fall through to config.json).
     ...(options.domainSessionModel !== undefined ? { domainSessionModel: options.domainSessionModel } : {}),
   })
-  eq([...registered.keys()].sort(), EXPECTED_TOOLS, `apply 后注册的工具集不是 11 个: ${[...registered.keys()]}`)
+  eq([...registered.keys()].sort(), EXPECTED_TOOLS, `apply 后注册的工具集不是 12 个: ${[...registered.keys()]}`)
   return { ctx, registered }
 }
 
@@ -389,7 +390,7 @@ for (const cfg of [undefined, null]) {
   const registered = new Map()
   const ctx = { tools: { register: (d) => registered.set(d.name, d) }, agents: { list: () => [], get: () => undefined } }
   mod.default.apply(ctx, cfg)
-  eq(registered.size, 11, `apply(ctx, ${String(cfg)}) 后工具数不是 11`)
+  eq(registered.size, 12, `apply(ctx, ${String(cfg)}) 后工具数不是 12`)
   eq(mod.default.name, 'domain-bridge', '插件名变了')
 }
 
@@ -5218,6 +5219,131 @@ const SET_DEFAULT_NOTE = '影响之后新建的、且尚无会话级选择的 Ag
 }
 
 console.warn = realWarn
+// ------------------------------------------------------------------ 16. v0.8.14 list_domain_queue（只读队列查询）
+//
+// 用户第 60 条「积压要看得见、撤得回」：id 只在发送被暂停拦下那一刻的回执里出现过，丢了就撤不回。
+// 这里验三件事：① 只读（跑前跑后队列文件逐字节不变）；② 过滤口径（status / mine / domain）；
+// ③ 与 withdraw 配合：只给 domain 就能撤该队列**最新一条 pending**（默认只认自己的）。
+
+{
+  const book = bookFile('v0814-queue', { 'misas:asr': owner('misas', 'asr', ID.B) })
+  const stateDir = path.join(root, 'state-v0814-queue')
+  await pauseDomain(book, stateDir, 'misas:asr', 'v0814-queue', [])
+  const queueFile = queuePath(stateDir, 'misas:asr')
+
+  const mine1 = await call(
+    mount({ domainsFile: book, stateDir }),
+    'send_to_domain',
+    { target: 'misas:asr', message: '第一条（我发的）' },
+    { agent: sender },
+    'v0814/send-1',
+  )
+  const mine2 = await call(
+    mount({ domainsFile: book, stateDir }),
+    'send_to_domain',
+    { target: 'misas:asr', message: '第二条（我发的）' },
+    { agent: sender },
+    'v0814/send-2',
+  )
+  const theirs = await call(
+    mount({ domainsFile: book, stateDir }),
+    'send_to_domain',
+    { target: 'misas:asr', message: '第三条（别人发的）' },
+    { agent: makeAgent(ID.C) },
+    'v0814/send-other',
+  )
+  eq(typeof mine1.queue?.id, 'string', '发送被暂停拦下时应入队并给 id')
+  eq(typeof mine2.queue?.id, 'string', '第二条也应入队')
+
+  const before = fs.readFileSync(queueFile, 'utf8')
+  const listed = await call(
+    mount({ domainsFile: book, stateDir }),
+    'list_domain_queue',
+    {},
+    { agent: sender },
+    'v0814/list-default',
+  )
+  const after = fs.readFileSync(queueFile, 'utf8')
+  eq(before, after, 'list_domain_queue 必须只读：队列文件一个字节都不能变')
+  eq(listed.outcome, 'ok', '默认查询应成功')
+  eq(listed.filters.status, 'pending', '默认只看 pending')
+  eq(listed.entries.length, 3, '三条 pending 都应列出')
+  eq(listed.totals.pending, 3, 'pending 总数应为 3')
+  eq(listed.queues[0].key, 'misas:asr', '队列行应给出 key')
+  eq(listed.queues[0].scope, 'domain', '域键的 scope 应为 domain')
+  ok(listed.entries.every((entry) => entry.id && entry.status === 'pending'), '每条都要有 id 且状态 pending')
+  ok(typeof listed.entries[0].fromShort === 'string' || listed.entries[0].fromShort === null, '应给发件人短号')
+  eq(listed.latestId, theirs.queue.id, 'latestId 应是全局最新一条 pending（含别人发的）')
+  eq(listed.latestMineId, mine2.queue.id, 'latestMineId 应是"我自己发的"里最新一条')
+
+  const delivered = await call(
+    mount({ domainsFile: book, stateDir }),
+    'list_domain_queue',
+    { status: 'delivered' },
+    { agent: sender },
+    'v0814/list-delivered',
+  )
+  eq(delivered.entries.length, 0, '没有已投递的条目')
+  eq(delivered.totals.pending, 3, '状态过滤不影响 pending 总数')
+
+  const mineOnly = await call(
+    mount({ domainsFile: book, stateDir }),
+    'list_domain_queue',
+    { mine: true },
+    { agent: sender },
+    'v0814/list-mine',
+  )
+  eq(mineOnly.entries.length, 2, 'mine=true 只列本会话发的')
+  ok(mineOnly.entries.every((entry) => entry.from === ID.S), 'mine=true 不应混进别人的消息')
+
+  const badStatus = await call(
+    mount({ domainsFile: book, stateDir }),
+    'list_domain_queue',
+    { status: 'nope' },
+    { agent: sender },
+    'v0814/list-bad-status',
+  )
+  eq(badStatus.outcome, 'invalid', '非法 status 应 invalid')
+  eq(badStatus.reason, 'bad-status', 'reason 应为 bad-status')
+
+  const otherDomain = await call(
+    mount({ domainsFile: book, stateDir }),
+    'list_domain_queue',
+    { domain: 'misas:gui' },
+    { agent: sender },
+    'v0814/list-other-domain',
+  )
+  eq(otherDomain.entries.length, 0, '别的域没有队列 ⇒ 空列表（不是报错）')
+
+  // 与 withdraw 配合：只给 domain ⇒ 撤最新一条「自己的」pending（别人的要先 force）
+  const latestMine = await call(
+    mount({ domainsFile: book, stateDir }),
+    'withdraw_domain_message',
+    { domain: 'misas:asr' },
+    { agent: sender },
+    'v0814/withdraw-latest-mine',
+  )
+  eq(latestMine.outcome, 'withdrawn', '只给 domain 应能撤最新一条')
+  eq(latestMine.pickedLatest, true, '回执要标注"选的是最新一条"')
+  eq(latestMine.id, mine2.queue.id, '撤的应是我自己发的最新一条，不是别人的')
+  const remaining = fs
+    .readFileSync(queueFile, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((record) => record.status === 'pending')
+  eq(remaining.length, 2, '撤一条后应还剩 2 条 pending')
+
+  const emptyQueue = await call(
+    mount({ domainsFile: book, stateDir }),
+    'withdraw_domain_message',
+    { domain: 'misas:gui' },
+    { agent: sender },
+    'v0814/withdraw-empty-queue',
+  )
+  eq(emptyQueue.outcome, 'not-found', '空队列撤最新一条应 not-found（不假装成功）')
+}
+
 // ------------------------------------------------------------------ summary
 
 console.log(

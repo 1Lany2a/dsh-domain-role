@@ -1,6 +1,6 @@
 # 域桥插件
 
-> 这一页只讲一件事：dsh 宿主插件 `dsh-domain-bridge`（下文简称「域桥」）——它是什么、有哪 11 个工具、配置与状态落在哪、怎么装、怎么测，以及三条它**做不到**的边界。
+> 这一页只讲一件事：dsh 宿主插件 `dsh-domain-bridge`（下文简称「域桥」）——它是什么、有哪 12 个工具、配置与状态落在哪、怎么装、怎么测，以及三条它**做不到**的边界。
 > 代码在 `plugins/dsh-domain-bridge/`。概念侧（域／负责人／在任声明）见 `01-concepts.md`，判断理由见 `04-design-decisions.md`。
 
 ## 1. 它是什么
@@ -12,7 +12,7 @@
 - `inject: ['tools', 'agents']`；`sessionController` / `workspaceRegistry` / `agentDefaultModel` / `sessionQuery` / `agentPresets` **故意不写进 inject**，一律 `ctx.get(...)` 可选取用 ⇒ 本部署没挂这些服务时插件**照常加载**，并如实回报 `{created:false, reason:"sessionController-unavailable"}`，而不是让加载器硬失败。
 - `apply()` **永不抛错**（顶层 try/catch + `warn()`）：宁可少注册几个工具，也不能让宿主起不来。
 
-## 2. 11 个工具
+## 2. 12 个工具
 
 顺序＝`lib/bridge.js` 里 `apply()` 的注册顺序（与包内 README 的工具表逐条对应）：
 
@@ -76,7 +76,7 @@
 
 ## 6. 测试
 
-跑 `node test/smoke.mjs`（或 `npm test`）。它对 11 个工具**每条可达分支**做深度扫描 + 无损往返断言，并按版本追加分组：
+跑 `node test/smoke.mjs`（或 `npm test`）。它对 12 个工具**每条可达分支**做深度扫描 + 无损往返断言，并按版本追加分组：
 
 | 节 | 覆盖 |
 |---|---|
@@ -95,9 +95,9 @@
 | summary | 打印基线数字（**不是断言**，见下） |
 
 - 冻结项：envelope 文案、`list_domain_sessions` 顶层键集、工具集**逐字相等**（`test/smoke.mjs:320`）、`VERSION == package.json version`。
-- **基线（2026-10-24，0.8.12）**：8/8 套件、**610 用例**、smoke 290 / 56,934 分支断言。⚠️ summary 仍只**打印**这些数字、不断言，所以新增/删除用例时仍需人眼比对（这也是每次改插件前先跑一遍基线的原因）。
+- **基线（2026-10-24，0.8.14）**：8/8 套件、**626 用例**、smoke 301 / 59,101 分支断言。⚠️ summary 仍只**打印**这些数字、不断言，所以新增/删除用例时仍需人眼比对（这也是每次改插件前先跑一遍基线的原因）。
 - `npm test` 从 0.8.10 起是 `node test/run-all.mjs`，串起全部 8 个套件（此前只跑 smoke）。
-- ⚠️ **加第 12 个工具会打断 3 处断言**：工具集逐字相等（`:320`）、`registered.size === 11`（`:391`）、版本字面量（`:398`）⇒ 加工具必须**同一批**改测试。
+- ⚠️ **再加第 13 个工具会打断 3 处断言**：工具集逐字相等、`registered.size === 12`、版本字面量 ⇒ 加工具必须**同一批**改测试。
 
 ## 7. 三条边界（它做不到什么）
 
@@ -111,7 +111,7 @@
 - `plugins/dsh-domain-bridge/CHANGELOG.md`（版本行为变化与各版本测试基线）
 - `plugins/dsh-domain-bridge/package.json`（name／version／type／main／engines／peerDependencies／scripts）
 - `plugins/dsh-domain-bridge/cordis.patch.yml`（部署配置键与四层解析注释）
-- `plugins/dsh-domain-bridge/lib/bridge.js`（11 个工具的注册顺序、`inject`、`apply` 永不抛错）
+- `plugins/dsh-domain-bridge/lib/bridge.js`（12 个工具的注册顺序、`inject`、`apply` 永不抛错）
 - `plugins/dsh-domain-bridge/lib/core/shared.js`（`resolveRuntime` 四层解析、`stateRoot` / `stateDirs` / `stateFileName` 文件名规则）
 - `plugins/dsh-domain-bridge/lib/core/tools.js`（`registerTool` 两 realm 兼容、`pruneUndefined` 无损输出唯一收口）
 - `plugins/dsh-domain-bridge/lib/core/declaration.js`（`declareNewOwner`）

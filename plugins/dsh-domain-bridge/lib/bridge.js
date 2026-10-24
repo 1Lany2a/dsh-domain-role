@@ -30,7 +30,7 @@
 import { VERSION, resolveRuntime, stateRoot } from './core/shared.js'
 import { warn, registerTool } from './core/tools.js'
 import { buildSendTool } from './core/messaging.js'
-import { buildSetDomainStateTool, buildWithdrawMessageTool } from './core/pause.js'
+import { buildSetDomainStateTool, buildWithdrawMessageTool, buildListDomainQueueTool } from './core/pause.js'
 import { buildListTool, buildClaimTool, buildReleaseTool, buildListOwnersTool } from './core/declaration.js'
 import { buildListModelsTool, buildSetModelTool, buildSetDefaultModelTool, buildCreateSessionTool } from './core/session-factory.js'
 import { runInitialize } from './core/bootstrap.js'
@@ -97,6 +97,7 @@ export default {
         create: buildCreateSessionTool(ctx, config),
         pause: buildSetDomainStateTool(ctx, config),
         withdraw: buildWithdrawMessageTool(ctx, config),
+        listQueue: buildListDomainQueueTool(ctx, config),
         listModels: buildListModelsTool(ctx, config),
         setModel: buildSetModelTool(ctx, config),
         setDefaultModel: buildSetDefaultModelTool(ctx),
@@ -146,6 +147,7 @@ export default {
       warn(
         `loaded v${VERSION} (tools: list_domain_sessions, send_to_domain, claim_domain, release_domain, ` +
           `list_domain_owners, create_domain_session, set_domain_state, withdraw_domain_message, ` +
+          `list_domain_queue, ` +
           `list_models, set_model, set_default_model; ` +
           `home: ${config.home || '(none)'}; ` +
           `config: ${runtime.configFile || '(none)'}${runtime.configError ? ` [read failed: ${runtime.configError}]` : ''}; ` +

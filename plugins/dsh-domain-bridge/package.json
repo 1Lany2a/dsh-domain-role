@@ -1,6 +1,6 @@
 {
   "name": "dsh-domain-bridge",
-  "version": "0.8.13",
+  "version": "0.8.14",
   "description": "域可达层：声明优先的域寻址、会话工厂、四级「已暂停」、唤醒接线、模型分派与斜杠命令（带弹窗菜单）。工具清单与口径见 README.md，变更史见 CHANGELOG.md。",
   "type": "module",
   "main": "lib/bridge.js",

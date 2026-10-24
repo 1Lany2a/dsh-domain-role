@@ -7,7 +7,7 @@
 
 > **English summary**: A cross-session governance framework for DeepSeek Harness (dsh). Instead of treating chat windows as disposable workers, it gives every area of responsibility a durable *domain* identity, an explicit *duty declaration* ("who owns this domain right now"), a mailbox with pause/queue semantics, and role task books that let a new session start working in one message. It is deliberately **not** another agent-team runtime: the unit of identity is the domain, not the session.
 
-> ⚠️ **状态：实验性 / 半成品（插件 v0.8.13）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
+> ⚠️ **状态：实验性 / 半成品（插件 v0.8.14）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
 
 ---
 
@@ -65,7 +65,7 @@ AI 编程的日常里，有三件事反复伤人：
 | **派发口径** | 三级会话怎么分工、任务怎么派、编号怎么编、达成报告五段字段 | `templates/dispatch-template.md` |
 | **索引** | 从会话存档、使命库与域名册生成「谁在动哪个文件、有没有冲突」 | `tools/session-registry.mjs` |
 | **交接包** | 给接手方生成开局材料（默认 JSON，要人读时现渲一页 MD） | `tools/session-registry.mjs --handoff` |
-| **域桥插件** | dsh 宿主插件，11 个工具：投递／建会话／认领／释放／暂停／撤回／列在任／列会话／列模型／改模型／改默认模型；外加**六条斜杠命令**（`/register` `/initialize` `/handoff` `/retire` `/pause` `/pause-all`，v0.8 起带**弹窗菜单**，不用背参数） | `plugins/dsh-domain-bridge/` |
+| **域桥插件** | dsh 宿主插件，12 个工具：投递／建会话／认领／释放／暂停／撤回／列在任／列会话／列模型／改模型／改默认模型；外加**六条斜杠命令**（`/register` `/initialize` `/handoff` `/retire` `/pause` `/pause-all`，v0.8 起带**弹窗菜单**，不用背参数） | `plugins/dsh-domain-bridge/` |
 | **文档渲染器** | 结构化数据 → 单文件 HTML（数据是唯一可编辑处，页面是产物） | `tools/render-doc.mjs` |
 
 ## ⚠️ 安全与风险（用之前先读）
@@ -130,7 +130,7 @@ publish.ps1                  首次推 GitHub 的一次性脚本（凭证只读�
 |---|---|
 | `docs/01-concepts.md` | 概念模型：域／会话／负责人／生命周期／拓扑 |
 | `docs/02-mechanisms.md` | 机制：在任声明、四级暂停、投递与队列、交接、编号、唯一写者、审计闸 |
-| `docs/03-plugin.md` | 域桥插件：11 个工具、配置、状态目录、重启口径 |
+| `docs/03-plugin.md` | 域桥插件：12 个工具、配置、状态目录、重启口径 |
 | `docs/04-design-decisions.md` | 为什么这么选（含与 agent team 的对照与更正） |
 | `docs/05-roles.md` | 角色任务书格式与 8 个角色 |
 | `docs/06-limitations.md` | 已知边界与未验项（诚实清单） |

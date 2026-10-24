@@ -1857,68 +1857,108 @@ export function buildSetDomainStateTool(ctx, config) {
  * v0.4.0：把**自己发的**一条队列消息撤回（默认只允许撤回自己发的；`force:true` 才动别人的）。
  * 只对 `status:'pending'` 的消息生效——已 delivered / failed / withdrawn 的不动（不假装收回）。
  */
+
+/**
+ * 把「队列过滤参数」解析成一个队列 key（域键或会话键）。`withdraw_domain_message` 与
+ * `list_domain_queue` **共用同一套解析**——两处各写一份，查到的和撤到的就可能不是同一条队列。
+ * 返回 `{ok:true,key}` 或 `{ok:false,reason,candidates?,hint?}`；永不抛。
+ */
+function resolveQueueKeyArg({ config, domainArg, self, ctx }) {
+  const rawWanted = String(domainArg ?? '').trim()
+  const wanted = rawWanted.toLowerCase()
+  if (!wanted) return { ok: false, reason: 'missing-domain', hint: 'domain 不能为空。' }
+  if (queueScopeOf(wanted) === SCOPE_SESSION || wanted.startsWith('sess')) {
+    // 只按会话 id 找队列 key，不需要体系索引（用空索引即可，别在这里读盘）。
+    const rows = liveTopLevel(ctx, emptyIndex())
+    const resolved = resolveSessionKeyForState(loadDeclarations(config.domainsFile), rows, rawWanted)
+    if (resolved.error) {
+      return { ok: false, reason: resolved.reason ?? resolved.error, candidates: resolved.candidates ?? null, hint: resolved.error }
+    }
+    return { ok: true, key: String(resolved.id).toLowerCase() }
+  }
+  const declarations = loadDeclarations(config.domainsFile)
+  const resolved = resolveDomainKeyForState(declarations, rawWanted, self.cwd)
+  if (resolved.error) {
+    return { ok: false, reason: resolved.error, candidates: resolved.candidates ?? null, hint: null }
+  }
+  return { ok: true, key: String(resolved.key).toLowerCase() }
+}
+
 export function buildWithdrawMessageTool(ctx, config) {
   return tool(
     'withdraw_domain_message',
     '**撤回一条还在队列里的域间消息**（v0.4.0）。`send_to_domain` 被「已暂停」拦下时，回执里的 `queue.id` 就是这里要的 `id`；消息在 `<stateDir>/inbox/<key>.jsonl` 里，一行一条、`status:pending`。默认**只允许撤回自己发的**（`from` 必须等于本会话 id）；`force:true` 才允许动别人发的（回执会标 `forced:true`）。只有 `pending` 能撤：已经 `delivered` / `failed` / `withdrawn` 的**不动**（如实回 `not-pending`，不假装收回）。撤回后该条变成 `status=withdrawn` 并留在文件里当留痕（不删行）。**边界**：这管不了"人已经在对方窗口里看到的那条"——它只管插件自己的落盘队列。',
     {
-      id: { type: 'string', description: '要撤回的队列消息 id（send_to_domain 被暂停拦下时的回执里 queue.id）' },
+      id: { type: 'string', description: '要撤回的队列消息 id。**可省略**（v0.8.14）：只给 domain 时，撤该队列里**最新一条 pending**（默认只认本会话发的，force 才看别人的）。' },
       domain: { type: 'string', description: '可选：按**队列 key** 过滤（更快、更明确）。v0.4.2 起队列按“被投递目标自身的键”分片，所以这里两种写法都认：域键（短名或「项目:域」）或**会话 id**（完整 id，或唯一命中的短号 sess-xxxxxxxx）。不给就扫全部队列文件。' },
       force: { type: 'boolean', description: '默认 false ＝ 只允许撤回**自己发的**（from == 本会话 id）。true ＝ 也允许撤回别人发的（回执带 forced:true）。' },
     },
     async (args, exec) => {
       const self = describe(exec?.agent, emptyIndex())
-      const id = String(args.id ?? '').trim()
-      if (!id) {
+      const domainArg = args.domain === undefined || args.domain === null ? '' : String(args.domain).trim()
+      let id = String(args.id ?? '').trim()
+      let pickedLatest = false
+      if (!id && !domainArg) {
         return {
           action: 'withdraw',
           outcome: 'invalid',
           reason: 'missing-id',
           self,
-          hint: 'id 必填：send_to_domain 被暂停拦下时，回执里的 queue.id 就是它（想先看看有哪些，用 list_domain_owners 的 domainState 段 / 直接看队列文件）。',
+          hint:
+            'id 必填，或者给 domain 撤该队列**最新一条 pending**。想看有哪些：list_domain_queue（只读，列出 id / from / at / status）。',
         }
       }
       const inboxes = loadInboxes(config.stateDir)
       let keys = [...inboxes.byKey.keys()]
-      const domainArg = args.domain === undefined || args.domain === null ? '' : String(args.domain).trim()
       if (domainArg) {
         // v0.4.2：队列按「被投递目标自身的键」分片 ⇒ `domain` 过滤要同时认两种键形状：
         //   ① 域键（域短名 / `项目:域`）⇒ 走 v0.4.0 的域解析；
         //   ② 会话键（完整 id 或短号，队列按会话 id 分片）⇒ 直接按队列 key 匹配。
         // 撤回**不受 scope 影响**（它只改 status，不看政策轴）。
-        const rawWanted = domainArg.toLowerCase()
-        let wanted = null
-        if (queueScopeOf(domainArg) === SCOPE_SESSION || rawWanted.startsWith('sess')) {
-        // 本工具只按会话 id 找队列 key，不需要体系索引（用空索引即可，别在这里读盘）。
-        const rowsForWithdraw = liveTopLevel(ctx, emptyIndex())
-          const resolvedSession = resolveSessionKeyForState(loadDeclarations(config.domainsFile), rowsForWithdraw, domainArg)
-          if (resolvedSession.error) {
-            return {
-              action: 'withdraw',
-              outcome: 'invalid',
-              reason: resolvedSession.reason ?? resolvedSession.error,
-              candidates: resolvedSession.candidates ?? null,
-              self,
-              hint: resolvedSession.error,
-            }
+        const resolved = resolveQueueKeyArg({ config, domainArg, self, ctx })
+        if (!resolved.ok) {
+          return {
+            action: 'withdraw',
+            outcome: 'invalid',
+            reason: resolved.reason,
+            ...(resolved.candidates ? { candidates: resolved.candidates } : {}),
+            self,
+            ...(resolved.hint ? { hint: resolved.hint } : {}),
           }
-          wanted = String(resolvedSession.id).toLowerCase()
-        } else {
-          const declarations = loadDeclarations(config.domainsFile)
-          const resolved = resolveDomainKeyForState(declarations, domainArg, self.cwd)
-          if (resolved.error) {
-            return {
-              action: 'withdraw',
-              outcome: 'invalid',
-              reason: resolved.error,
-              candidates: resolved.candidates ?? null,
-              self,
-            }
-          }
-          wanted = String(resolved.key).toLowerCase()
         }
-        keys = keys.filter((key) => key === wanted)
+        keys = keys.filter((key) => key === resolved.key)
       }
+
+      // v0.8.14：只给 domain 不给 id ⇒ 撤这个队列里**最新一条 pending**（默认只认自己的，force 才看别人的）。
+      // 起因：撤回要抄 id，而 id 只在"发送被暂停拦下"那一刻的回执里出现过，丢了就撤不回。
+      if (!id) {
+        const candidates = []
+        for (const key of keys) {
+          for (const record of inboxes.byKey.get(key) || []) {
+            if (record.status !== INBOX_PENDING) continue
+            if (args.force !== true && String(record.from ?? '') !== String(self.id ?? '')) continue
+            candidates.push({ key, record })
+          }
+        }
+        candidates.sort((a, b) => String(b.record.at ?? '').localeCompare(String(a.record.at ?? '')))
+        if (!candidates.length) {
+          return {
+            action: 'withdraw',
+            outcome: 'not-found',
+            domain: domainArg,
+            inboxDir: inboxes.dir,
+            queuedKeys: [...inboxes.byKey.keys()].sort(),
+            self,
+            hint:
+              `「${domainArg}」的队列里没有可撤的 pending` +
+              `${args.force === true ? '' : '（默认只看本会话发的；要看别人发的加 force=true）'}。` +
+              '想先看看有哪些：list_domain_queue。',
+          }
+        }
+        id = String(candidates[0].record.id)
+        pickedLatest = true
+      }
+
       const hits = []
       for (const key of keys) {
         for (const record of inboxes.byKey.get(key) || []) {
@@ -2020,6 +2060,7 @@ export function buildWithdrawMessageTool(ctx, config) {
         fromShort,
         mode: record.mode ?? null,
         queuedAt: record.at ?? null,
+        pickedLatest,
         withdrawnAt: at,
         withdrawnBy: self.id ?? null,
         messagePreview: clipToBytes(record.message ?? '', 80),
@@ -2032,6 +2073,131 @@ export function buildWithdrawMessageTool(ctx, config) {
           `已撤回 id=${id}（「${key}」的队列，status=withdrawn；记录留在文件里当留痕）。` +
           `这个域现在还有 ${inbox.pending} 条 pending。` +
           (forced && !mine ? '（这次是 force 撤回**别人发的**消息。）' : ''),
+      }
+    },
+  )
+}
+
+// ------------------------------------------------- v0.8.14 list_domain_queue（只读队列查询）
+
+/**
+ * 为什么有这个工具（2026-10-24，用户第 60 条「积压要看得见、撤得回」）：
+ *   · `withdraw_domain_message` 要 id，而 id 只在"发送被暂停拦下"那一刻的回执里露过面——**丢了就撤不回**；
+ *   · `list_domain_owners` 每行只有 `pending` 计数，看不到"是哪几条、谁发的、什么时候"。
+ * 所以补一个**只读**的队列查询，与 withdraw 共用同一套 key 解析（`resolveQueueKeyArg`）。
+ * **边界**：只管插件自己的落盘队列——宿主 composer 里那条「N 条排队消息」不在这里，插件也看不见。
+ */
+export function buildListDomainQueueTool(ctx, config) {
+  return tool(
+    'list_domain_queue',
+    '**只读：列出插件落盘队列里的消息**（v0.8.14）。发送被「已暂停」拦下时消息会落盘入队（`<stateDir>/inbox/<key>.jsonl`），这里能看见 id / 状态 / 发件人 / 入队时间 / mode / 正文摘要，配合 `withdraw_domain_message` 就能撤（也可以只给 domain 撤最新一条）。默认只看 `pending`；`status` 可给 pending / delivering / delivered / failed / withdrawn / all。`domain` 可写域短名、`项目:域`、或会话 id（短号也行）。**边界**：这只管插件自己的队列——宿主 composer 里显示的「N 条排队消息」不在里面，插件看不见也撤不回（宿主边界）。',
+    {
+      domain: { type: 'string', description: '可选：只看某个队列（域短名 / `项目:域` / 会话 id 或短号）。不给就扫全部队列。' },
+      status: { type: 'string', description: 'pending（默认）| delivering | delivered | failed | withdrawn | all。' },
+      mine: { type: 'boolean', description: '默认 false；true ＝ 只看本会话（调用者）发出的。' },
+      limit: { type: 'number', description: '最多返回多少条（默认 50，最大 200），按入队时间倒序。' },
+    },
+    async (args, exec) => {
+      const self = describe(exec?.agent, emptyIndex())
+      const statusArg = String(args.status ?? 'pending').trim().toLowerCase() || 'pending'
+      const allowed = [INBOX_PENDING, INBOX_DELIVERING, INBOX_DELIVERED, INBOX_FAILED, INBOX_WITHDRAWN, 'all']
+      if (!allowed.includes(statusArg)) {
+        return {
+          action: 'queue',
+          outcome: 'invalid',
+          reason: 'bad-status',
+          status: statusArg,
+          allowed,
+          self,
+          hint: 'status 只能是 pending / delivering / delivered / failed / withdrawn / all。',
+        }
+      }
+      const limitRaw = Number(args.limit ?? 50)
+      const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.trunc(limitRaw))) : 50
+      const mineOnly = args.mine === true
+      const domainArg = args.domain === undefined || args.domain === null ? '' : String(args.domain).trim()
+      const inboxes = loadInboxes(config.stateDir)
+      let keys = [...inboxes.byKey.keys()].sort()
+      if (domainArg) {
+        const resolved = resolveQueueKeyArg({ config, domainArg, self, ctx })
+        if (!resolved.ok) {
+          return {
+            action: 'queue',
+            outcome: 'invalid',
+            reason: resolved.reason,
+            ...(resolved.candidates ? { candidates: resolved.candidates } : {}),
+            self,
+            ...(resolved.hint ? { hint: resolved.hint } : {}),
+          }
+        }
+        keys = keys.filter((key) => key === resolved.key)
+      }
+
+      const queues = []
+      const entries = []
+      const pendingRecords = []
+      let pendingTotal = 0
+      let recordTotal = 0
+      for (const key of keys) {
+        const records = inboxes.byKey.get(key) || []
+        const pending = records.filter((record) => record.status === INBOX_PENDING).length
+        pendingTotal += pending
+        recordTotal += records.length
+        let lastAt = null
+        for (const record of records) {
+          if (!lastAt || String(record.at ?? '') > lastAt) lastAt = String(record.at ?? '') || lastAt
+          if (record.status === INBOX_PENDING) pendingRecords.push({ key, record })
+        }
+        queues.push({ key, scope: queueScopeOf(key), pending, total: records.length, lastAt })
+        for (const record of records) {
+          const status = record.status ?? null
+          if (statusArg !== 'all' && status !== statusArg) continue
+          if (mineOnly && String(record.from ?? '') !== String(self.id ?? '')) continue
+          entries.push({
+            id: record.id ?? null,
+            key,
+            scope: queueScopeOf(key),
+            status,
+            mode: record.mode ?? null,
+            from: record.from ?? null,
+            fromShort: shortId(record.from) ?? null,
+            replyTo: record.replyTo ?? null,
+            queuedAt: record.at ?? null,
+            preview: clipToBytes(String(record.message ?? record.content ?? ''), 80),
+            pausedByScopes: Array.isArray(record.pausedByScopes) ? record.pausedByScopes : null,
+            deliveredAt: record.deliveredAt ?? null,
+            failedReason: record.failedReason ?? null,
+            withdrawnAt: record.withdrawnAt ?? null,
+            withdrawnBy: record.withdrawnBy ?? null,
+          })
+        }
+      }
+      entries.sort((a, b) => String(b.queuedAt ?? '').localeCompare(String(a.queuedAt ?? '')))
+      const shown = entries.slice(0, limit)
+      pendingRecords.sort((a, b) => String(b.record.at ?? '').localeCompare(String(a.record.at ?? '')))
+      const latestPending = pendingRecords[0] ?? null
+      const latestMine = pendingRecords.find((item) => String(item.record.from ?? '') === String(self.id ?? '')) ?? null
+      return {
+        action: 'queue',
+        outcome: 'ok',
+        filters: { domain: domainArg || null, status: statusArg, mine: mineOnly, limit },
+        inboxDir: inboxes.dir,
+        inboxesError: inboxes.error ?? null,
+        totals: { queues: queues.length, pending: pendingTotal, records: recordTotal, matched: entries.length },
+        queues,
+        count: shown.length,
+        truncated: entries.length > shown.length,
+        latestId: latestPending?.record?.id ?? null,
+        latestKey: latestPending?.key ?? null,
+        latestMineId: latestMine?.record?.id ?? null,
+        latestMineKey: latestMine?.key ?? null,
+        entries: shown,
+        degraded: inboxes.degraded ?? [],
+        self,
+        hint:
+          `队列里现在有 ${pendingTotal} 条 pending。撤回：withdraw_domain_message(id=…)` +
+          `${latestMine ? `（最新一条你自己发的：id=${latestMine.record.id}；也可以只给 domain 撤最新一条）` : ''}。` +
+          '这只是**插件落盘队列**；宿主 composer 里显示的「N 条排队消息」不在里面，插件看不见、也撤不回（宿主边界）。',
       }
     },
   )
