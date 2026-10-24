@@ -1,6 +1,6 @@
 # dsh-domain-bridge
 
-**域可达层 v0.8.12**（v0.7.0 起新增**斜杠命令**（v0.8.5 起七条：加了 `/resume`）、v0.8 起带**弹窗菜单**、v0.8.7 起换届可**逐项设置**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
+**域可达层 v0.8.13**（v0.7.0 起新增**斜杠命令**（v0.8.5 起七条：加了 `/resume`）、v0.8 起带**弹窗菜单**、v0.8.7 起换届可**逐项设置**；模型分派：`list_models` 看目录、`set_model` 改单个会话的模型并**自动恢复**全局默认、`set_default_model` 显式改全局默认且**不恢复**）**——给"顶层会话之间互相看得见、发得到"补一段基础能力，让域会话能**自己认领/释放在任声明**，并让任一宿主侧会话能**直接开一个真顶层域会话**（`create_domain_session`）把开工任务排进去。v0.4 起还能把目标**按成「已暂停」**：插件介导的投递不再硬投，而是**落盘入队（可撤回）**，恢复时按原样重投；v0.4.1 修掉了「插件把离线会话拉活之后，它一跑回合就崩」那个 bug（`{{model}}` 唤醒 bug）；**v0.4.2 把「暂停」从域级推广到四级**（域 / 主＝单会话 / 项目 / 全局），判定＝**OR 叠加**、**两端都查**、`global` 要 `confirm`、恢复时**重评 OR**。
 
 > v0.4.2 一句话：**任一级被按下就拦，拦的时候把「是哪几级按的」全部说出来；解一级不够——得把压着目标的那几级都解开，才会重投。**
 
@@ -450,7 +450,7 @@ config:
 
 - **所有工具输出保证无损 JSON：任何位置都不含 `undefined`**（也不含 `NaN`/`±Infinity`/`-0`/`bigint`/`Date`/`Map`/`Set`/函数/循环引用）。宿主按"`JSON.parse(JSON.stringify(v))` 必须与原值相等"来校验；`JSON.stringify` 会**静默丢掉 `undefined` 键**，往返即有损 ⇒ 宿主整次拒收，报 `tool "<名字>" returned invalid output: value is not lossless JSON`，**且不指向具体字段**。
 - 实现：`lib/bridge.js` 里的 `pruneUndefined()` 在 `tool()` 工厂统一过一遍（**一个卡点覆盖 11 个工具的全部返回路径**，不逐分支打补丁）：删掉 `undefined`/函数/symbol 的键（数组里换成 `null`），并归一 `NaN`/`±Infinity`→`null`、`-0`→`0`、`bigint`→十进制字符串、`Date`→ISO 字符串、`Map`/`Set`→普通对象/数组、循环引用→`null`。
-- **回归护栏**：`npm test`（= `node test/run-all.mjs`，0.8.10 起串全部 8 个套件、每个套件独立临时 `DSH_DOMAIN_BRIDGE_HOME`）对 11 个工具**每条可达分支**做深度扫描 + 无损往返断言，并冻结 envelope 文案、`list_domain_sessions` 顶层键集与 `VERSION == package.json version`。当前基线：**8/8 套件、610 用例、smoke 290 / 56,934 分支断言**。新增分支请一并补例，别只断言某一个字段。
+- **回归护栏**：`npm test`（= `node test/run-all.mjs`，0.8.10 起串全部 8 个套件、每个套件独立临时 `DSH_DOMAIN_BRIDGE_HOME`）对 11 个工具**每条可达分支**做深度扫描 + 无损往返断言，并冻结 envelope 文案、`list_domain_sessions` 顶层键集与 `VERSION == package.json version`。当前基线：**8/8 套件、615 用例、smoke 290 / 56,934 分支断言**。新增分支请一并补例，别只断言某一个字段。
 - **v0.3.2 新增第 7 节**：入组 + 置顶的整条阶梯都用**假 registry + `create()` 探针**驱动（不真建会话、不真调 `pinSession`、不碰真 `workspace.json`）：命中/未命中、`workspaceId` 失败自动重试、两次都失败、**attach 失败不重建**（含只有错误文本 / 完全拿不到 id 两种退化）、`pinSession` 抛错、`pin:false` 不调 pin、拿不到 registry 时请求与 v0.3.1 **逐字相同**，以及 `list()` 兜底 / resolve 抛错 / 没有 `pinSession` / 经 `ctx.get` 取值 / `ctx.get` 抛错回落属性读取。
 - **v0.4.0 新增第 11 节**：域级「已暂停」的整条政策轴（按下/幂等/非法 state/没声明/短名解析、投递拦截与落盘队列、`dryRun`、按会话 id 直投也拦、`create_domain_session` 拒绝、`wake` 被拦与 `force` 放行、`claim`/`release` 照常允许、撤回的四种结局、恢复重投的四条路、五种派生状态一次列全、未暂停域的**键集逐字回归**、状态文件坏掉/写不动/队列坏行的降级）。全部跑在**每个 mount 自己的临时 `stateDir`**，绝不碰真实的运行期 `state/`。
 - **v0.4.1 新增第 12 节**：`{{model}}` 唤醒 bug 的修复——每条用例都让**真的 resume 调用**穿过一个"像宿主一样真的会回调 `setup`"的假 agents 服务：取源① `ctx.agentDefaultModel`、取源② 存档里那条 `request/header`、存档读不懂时**降级成 `none` 且绝不猜**、两条都空时**拒绝裸拉**（`no-wake-wiring`，一次 resume 都不调；`probe` / `mode:"inject"` 放行、`force` 也越不过）、`setup` 抛错**只记不抛**（回执 `failed` + `setupError`）、旧入口 `sessionController.resume` 带不了接线时一并拒绝，以及 F2 停机通知对**已暂停**的域**照发**（且不进队列）。

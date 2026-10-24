@@ -11,6 +11,7 @@ import {
   cardFromBrief,
   handoffTaskText,
   HANDOFF_CARD_RULES,
+  HANDOFF_CARD_HANDOVER,
   HANDOFF_CARD_MAX_BYTES,
 } from '../lib/core/handoff-card.js'
 
@@ -268,6 +269,11 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(!card.markdown.includes('缩进子项'), '缩进子项不算顶层条目')
   caseOk(!card.markdown.includes('别的节里的这一条'), '别的节的条目不得进卡')
   caseOk(HANDOFF_CARD_RULES.every((rule) => card.markdown.includes(rule)), '4 条第一轮硬规则必须全部在卡上')
+  // v0.8.13（第 61 条）：交接前后流程要钉在卡底——接任者只读这张纸，不能靠记性。
+  caseOk(
+    card.markdown.includes('交接清单') && HANDOFF_CARD_HANDOVER.every((step) => card.markdown.includes(step)),
+    '交接卡底部必须有交接前后清单（第 61 条）',
+  )
   caseOk(card.markdown.includes('session-test') && card.markdown.includes('tixiweihu:system'), '卡上要有在任键与上一任会话 id')
   caseOk(fs.existsSync(card.path) && fs.existsSync(card.jsonPath), '卡的 .md 与 .json 都必须真的落盘')
   caseOk(
@@ -276,6 +282,10 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   )
   const cardJson = JSON.parse(fs.readFileSync(card.jsonPath, 'utf8'))
   caseOk(cardJson.schema === 'dsh-domain-bridge/handoff-card@1' && cardJson.status.length === 3, '机器读那份要能被解析且带同一份事实')
+  caseOk(
+    Array.isArray(cardJson.handover) && cardJson.handover.length === HANDOFF_CARD_HANDOVER.length,
+    '机器读那份要带整份交接清单（回执/排障用）',
+  )
   caseOk(!card.markdown.includes('_registry'), '卡片里不该出现 _registry（它没写那里）')
 }
 
@@ -292,6 +302,10 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   const card = buildHandoffCard({ stateDir, cwd: longDir, key: 'other:long8k', layer: 'domain', previousSessionId: 'session-x' })
   caseOk(card.ok === true && card.bytes <= HANDOFF_CARD_MAX_BYTES, `超长条目也必须压到 ≤2048 B（实际 ${card.bytes}）`)
   caseOk(HANDOFF_CARD_RULES.every((rule) => card.markdown.includes(rule)), '压短条目时不得把硬规则挤掉')
+  caseOk(
+    HANDOFF_CARD_HANDOVER.every((step) => card.markdown.includes(step)),
+    '压短条目时不得把交接清单挤掉（它是卡底的固定部分）',
+  )
 }
 
 // 18.3 PROJECT.md 缺失 / 不可读 / 没有那两节：都不许抛，都要如实回报
@@ -349,6 +363,9 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(out.text.includes(`交接卡：${expectedPath}`), `回执必须带一行 交接卡：<path>（实际回执片段：${out.text.slice(0, 80)}…）`)
   caseOk(/（\d+ B）/.test(out.text), '回执必须带卡的字节数')
   caseOk(out.text.includes('只读+回报，不会自己开工'), '回执必须说明点开后它只读+回报、不会自己开工')
+  // v0.8.13（第 61 条）：回执是旧 lead 当场看的那一屏，最容易漏的一步要点名。
+  caseOk(out.text.includes('交接清单'), '回执必须点名交接清单')
+  caseOk(out.text.includes('inject'), '回执必须点名「交接前给域会话发 inject」这一步')
   caseOk(fs.existsSync(expectedPath), '回执里给的卡路径必须真的存在')
 }
 

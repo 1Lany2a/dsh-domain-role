@@ -3,6 +3,28 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.13] — 2026-10-24
+
+**交接清单固化（体系 PROJECT.md 第 61 条）：交接卡底部与 `/handoff` 回执各加一段「交接前后流程」。**
+
+### 一、交接卡底部加清单（`lib/core/handoff-card.js`）
+
+新增 `HANDOFF_CARD_HANDOVER` 并渲染成卡底 `## 交接清单（照做，别漏）`：交接前（旧 lead：在途任务写进 §当前状态 + 给在跑的域会话发一条 `inject`）→ 接班第一轮（核身份 / 只读本卡 / 回报三行 / 停手）→ 开工后（逐个域会话发一条消息、写明自己的 sessionId 与"后续回报发这里"）→ 旧 lead 退役（用户确认后由旧窗口 `/retire`）。
+
+为什么钉在卡底：域会话回报时记的是**旧 lead 的 sessionId**，一换届就投给旧 lead（离线 ⇒ 入队/不可达），新 lead 又不知道有在途任务。接任者只读这张纸，不能靠记性。
+
+机器读那份 JSON 新增 `handover` 数组；`brief` 卡（`create_domain_session.brief`）只进 JSON、不改调用方给的 markdown（避免破坏它的字节预算）。
+
+### 二、`/handoff` 回执点名（`lib/core/commands.js`）
+
+在"本会话还在任"提示之后补两行：清单去哪看（交接卡底部 + 体系根 `templates\dispatch-template.md` 的「交接前后流程」节）＋ **最容易漏的一步**：交接前给在跑的域会话发一条 `inject`，否则它们的回报会投给旧 lead（离线⇒入队/不可达）。
+
+### 三、验证
+
+`commands.test.mjs` 新增 4 条断言（卡底含清单全 4 步、超长条目压缩时清单不被挤掉、JSON 带 `handover`、回执点名 `inject`）；**8/8 套件 · 615 用例 · smoke 290/56,934 分支断言全绿**（仓库与部署两棵树逐文件 SHA1 一致）。
+
+⚠️ host 侧改动，**需重启 dsh 才生效**。完整口径见体系根 `templates\dispatch-template.md` 的「交接前后流程」节。
+
 ## [0.8.12] — 2026-10-24
 
 **P2 批次：域名册读改写进锁、HTTP 输入边界、`/state` 口径对齐。**

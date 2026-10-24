@@ -50,6 +50,21 @@ export const HANDOFF_CARD_RULES = [
   '本卡超过 24 小时就先问人，不要直接按它开工',
 ]
 
+/**
+ * 交接前后清单（2026-10-24，用户第 61 条待办「把交接前后流程固化成清单」）。
+ *
+ * 为什么钉在卡底：域会话回报时记的是**旧 lead 的 sessionId**；主会话一换届，回报会投给旧 lead
+ * （离线 ⇒ 入队/不可达），新 lead 又不知道有在途任务，旧 lead 若不等退役就双主写文档。
+ * 把「谁、在什么时候、把哪一步做掉」写进**接任者一定会读的那张纸**，才不会靠记性。
+ * 只列动作，不复制正文；完整版在体系根 `templates\dispatch-template.md` 的「交接前后流程」节。
+ */
+export const HANDOFF_CARD_HANDOVER = [
+  '交接前（旧 lead）：在途任务写进 PROJECT.md §当前状态；给在跑的域会话发一条 inject 告知换 lead',
+  '接班第一轮（你）：核身份 → 只读本卡 → 回报三行 → 停手',
+  '用户点头开工后（你）：逐个域会话发一条消息，写明你的 sessionId、「后续回报发这里」→ 核对在途产出',
+  '旧 lead 退役：用户确认你的回报后，由旧窗口 `/retire`（退役不会自己发生）',
+]
+
 const LAYER_WORDS = { system: '体系主会话', project: '项目主会话' }
 
 /** `domain` / `project` / `system` → 中文层名（与 commands.js 的老文案保持同一套词）。 */
@@ -188,6 +203,9 @@ function renderCard({ key, layer, previousSessionId, cwd, generatedAt, status, n
       '## 第一轮硬规则',
       ...HANDOFF_CARD_RULES.map((rule, index) => `${index + 1}. ${rule}`),
       '',
+      '## 交接清单（照做，别漏）',
+      ...HANDOFF_CARD_HANDOVER.map((step, index) => `${index + 1}. ${step}`),
+      '',
     ].join('\n')
   )
 }
@@ -301,6 +319,7 @@ export function buildHandoffCard({
     status: parsed.status,
     next: parsed.next,
     rules: HANDOFF_CARD_RULES,
+    handover: HANDOFF_CARD_HANDOVER,
     sectionsMissing: parsed.sectionsMissing,
     itemChars: rendered.itemChars,
     truncated: rendered.truncated,
@@ -314,6 +333,7 @@ export function buildHandoffCard({
 /**
  * 用调用方给的 `brief` 当卡内容（`create_domain_session` 的 `brief` 参数走这条路）。
  * 给字符串就原样用；给对象就 JSON 化。超过字节预算就**按字节截断**（绝不在多字节字符中间切）。
+ * 交接清单只进机器读那份：brief 的 markdown 归调用方，往里加内容会破坏它的字节预算。
  */
 export function cardFromBrief({
   brief,
@@ -359,6 +379,7 @@ export function cardFromBrief({
     cwd: workdir || null,
     projectFile: file || null,
     rules: HANDOFF_CARD_RULES,
+    handover: HANDOFF_CARD_HANDOVER,
     truncated,
     bytes: byteLengthOf(markdown),
     markdown,

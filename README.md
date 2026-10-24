@@ -7,7 +7,7 @@
 
 > **English summary**: A cross-session governance framework for DeepSeek Harness (dsh). Instead of treating chat windows as disposable workers, it gives every area of responsibility a durable *domain* identity, an explicit *duty declaration* ("who owns this domain right now"), a mailbox with pause/queue semantics, and role task books that let a new session start working in one message. It is deliberately **not** another agent-team runtime: the unit of identity is the domain, not the session.
 
-> ⚠️ **状态：实验性 / 半成品（插件 v0.8.12）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
+> ⚠️ **状态：实验性 / 半成品（插件 v0.8.13）**。这份代码是作者本人在用的工作系统，接口与目录结构仍会变。别把它当稳定版依赖。
 
 ---
 
