@@ -95,7 +95,8 @@
 | summary | 打印基线数字（**不是断言**，见下） |
 
 - 冻结项：envelope 文案、`list_domain_sessions` 顶层键集、工具集**逐字相等**（`test/smoke.mjs:320`）、`VERSION == package.json version`。
-- ⚠️ **「282 用例 / 54,624 断言」这个基线没有任何断言守着**：summary 只**打印** `分支用例 / 深度扫描节点 / 无损往返断言 / 分支断言`，不断言这些数字 ⇒ 只能靠**改前改后人眼比对**（这也是每次改插件前先跑一遍基线的原因）。
+- **基线（2026-10-24，0.8.12）**：8/8 套件、**610 用例**、smoke 290 / 56,934 分支断言。⚠️ summary 仍只**打印**这些数字、不断言，所以新增/删除用例时仍需人眼比对（这也是每次改插件前先跑一遍基线的原因）。
+- `npm test` 从 0.8.10 起是 `node test/run-all.mjs`，串起全部 8 个套件（此前只跑 smoke）。
 - ⚠️ **加第 12 个工具会打断 3 处断言**：工具集逐字相等（`:320`）、`registered.size === 11`（`:391`）、版本字面量（`:398`）⇒ 加工具必须**同一批**改测试。
 
 ## 7. 三条边界（它做不到什么）
@@ -107,7 +108,7 @@
 ## 出处
 
 - `plugins/dsh-domain-bridge/README.md`（工具表、两个轴 + 生命周期、四级「已暂停」、配置、落盘格式、安装、硬边界、返回契约）
-- `plugins/dsh-domain-bridge/CHANGELOG.md`（版本行为变化与 282 用例 / 54,624 断言基线）
+- `plugins/dsh-domain-bridge/CHANGELOG.md`（版本行为变化与各版本测试基线）
 - `plugins/dsh-domain-bridge/package.json`（name／version／type／main／engines／peerDependencies／scripts）
 - `plugins/dsh-domain-bridge/cordis.patch.yml`（部署配置键与四层解析注释）
 - `plugins/dsh-domain-bridge/lib/bridge.js`（11 个工具的注册顺序、`inject`、`apply` 永不抛错）
