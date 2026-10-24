@@ -153,6 +153,9 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
 
 // 7. F-09：project / global 暂停必须体现在会话行上（与 list_domain_* 同口径，四级 OR 叠加）
 {
+  // 基线可能不是 0：同文件前面的用例会留下 session 级暂停记录 ⇒ 只断言"比基线多 2 级"，
+  // 不硬编码 3（2026-10-24 测试域报过一次跨用例顺序依赖的 flaky）。
+  const beforeCount = buildStateSnapshot(ctx, deps, {}).totals.paused
   writeDomainStateAtomic(
     stateDir,
     'other',
@@ -167,8 +170,8 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   )
   const snap = buildStateSnapshot(ctx, deps, {})
   ok(
-    snap.totals.paused === 3,
-    `F-09：totals.paused 应数到三级（session 历史 1 + project 1 + global 1，实际 ${snap.totals.paused}）`,
+    snap.totals.paused === beforeCount + 2,
+    `F-09：totals.paused 应比基线多 2（project + global；基线 ${beforeCount}，实际 ${snap.totals.paused}）`,
   )
 
   const offlineMain = snap.sessions.find((row) => row.id === 'session-offline01')
