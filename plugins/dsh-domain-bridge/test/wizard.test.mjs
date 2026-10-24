@@ -47,6 +47,7 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
   ok(data.defaultLayer.key === 'tixiweihu:system', '键应来自注册册')
   ok(data.defaultPreset === 'cordis', '体系层默认 cordis')
   ok(data.defaults.title.startsWith('【体系】'), '标题默认带【体系】前缀')
+  ok(/^【体系】\d{4}-\d{2}-\d{2} \d{2}:\d{2} · /.test(data.defaults.title), '标题默认要带时间戳（v0.8.9：命令行与表单取同一份 defaultHandoffTitle）')
   ok(data.defaults.task.includes('PROJECT.md'), '开工任务默认文案应指向 PROJECT.md')
   ok(Array.isArray(data.models.groups) && data.models.empty === true, '没有模型服务时应如实报空目录')
   ok(data.permissions.some((row) => row.value === 'danger-full-access'), '权限档要列出全盘写这一档')
@@ -107,6 +108,17 @@ const ok = (cond, message) => { assert.ok(cond, message); passed++ }
 {
   const out = await runWizard(ctx, deps, { sessionId, params: {} })
   ok(out.ok === false && out.text.includes('交接命令不可用'), '缺定义时应如实拒绝')
+}
+
+// 7. 客户端契约：/handoff 的「逐项设置参数」走**应用内面板**（decorate + action + shell.overlay），
+//    旧的 openHandoffWizard() 作为兜底保留（覆盖层不可用 / 宿主未挂上时退回网页）。
+{
+  const source = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  ok(source.includes('function openHandoffWizard('), '客户端要保留 openHandoffWizard() 兜底')
+  ok(/kind:\s*'action'/.test(source), "handoff 的 ui.kind 必须是 'action'（popupSelect 选中必关，做不了多级）")
+  ok(source.includes('command.decorate({'), '必须用 decorate 挂到宿主命令上（同名 register 会撞名报错）')
+  ok(source.includes("slots.inject('shell.overlay'"), '面板必须挂在 shell.overlay（layout 的根级覆盖层）')
+  ok(source.includes('shell.overlay 未就绪'), '覆盖层不可用时要能退回旧网页设置')
 }
 
 console.log(`[wizard] 用例 ${passed} 条全部通过`)

@@ -11,7 +11,7 @@ import { TRACE_ID, TRACE_ID_V042, TRACE_ID_V061, loadIndex, emptyIndex, shortId,
 import { warn, tool } from './tools.js'
 import { loadInbox, domainEnvelope, domainMessage } from './messaging.js'
 import { pausedScopesWords, pausedTargetOf, pausedFactsOf, pausedCreateHint } from './pause.js'
-import { loadDeclarations, declarationInfo, splitDomainTarget, projectFromCwd, matchDeclaration, labelMatches, declareNewOwner, existingOwnerInfo, domainAlreadyOwnedHint, domainOwnedOverrideHint } from './declaration.js'
+import { loadDeclarations, readOwnersBook, declarationInfo, splitDomainTarget, projectFromCwd, matchDeclaration, labelMatches, declareNewOwner, existingOwnerInfo, domainAlreadyOwnedHint, domainOwnedOverrideHint } from './declaration.js'
 import { readRegistrations, upsertRegistration } from './registrations.js'
 
 export function getSessionController(ctx) {
@@ -1582,7 +1582,29 @@ export function buildCreateSessionTool(ctx, config) {
         // 全部是既有读取：loadIndex（= list_domain_sessions 用的那套会话索引）、loadDeclarations、
         // isSessionOnline、liveTopLevel。不新建任何台账/接口。
         const index = loadIndex(config.indexFile)
-        const declarations = loadDeclarations(config.domainsFile)
+        // ── F-04（鲁棒性审计 2026-10-23）：F1 闸必须 fail-closed。
+        // 旧行为：册子读不懂 ⇒ loadDeclarations 给"空册" ⇒ existingOwner=null ⇒ 闸看不见负责人，
+        // 静默放行第二条活会话（正是 2026-10-12 双活事故的形态）。现在先拒绝，dryRun 同样如实拒绝。
+        const ownersBook = readOwnersBook(config.domainsFile)
+        if (!ownersBook.ok) {
+          warn(
+            `[${TRACE_ID}] 拒绝为 ${key} 新建会话：域名册读不懂（${ownersBook.file}）：${ownersBook.detail}` +
+              ` ⇒ 不做所有权判断，本次建会话数=0（dryRun=${args.dryRun === true}）。`,
+          )
+          const refusal = {
+            created: false,
+            reason: 'domains-unreadable',
+            detail: ownersBook.detail,
+            key,
+            file: config.domainsFile,
+            self,
+            hint:
+              '域名册读不懂（' + ownersBook.detail + '）⇒ **不做所有权判断，本次没有建会话**：册子坏掉时看不见在任负责人，放行就等于允许第二条活会话。' +
+              '请人工修好 ' + config.domainsFile + ' 再试；文件不存在＝正常空册，不会被这条拦住。',
+          }
+          return args.dryRun === true ? { ...refusal, dryRun: true, refused: true } : refusal
+        }
+        const declarations = ownersBook.book
         const duties = dutyMap(declarations)
         let rows = []
         try {

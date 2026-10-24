@@ -177,6 +177,7 @@ const caseOk = (cond, message) => { assert.ok(cond, message); passed++ }
   caseOk(args.domain === 'tixiweihu:system', '体系主交接应指向该体系的注册键')
   caseOk(args.claim === true, '体系主交接必须 claim（写注册册，不是 owners）')
   caseOk(String(args.title).startsWith('【体系】'), '体系主接任标题应带【体系】前缀')
+  caseOk(/^【体系】\d{4}-\d{2}-\d{2} \d{2}:\d{2} · /.test(String(args.title)), '体系主接任标题应带时间戳（v0.8.9 修回：v0.8.5 把它丢了）')
 }
 
 // 15. /register project --takeover：真的强制接手（旧文案承诺过、代码没实现）

@@ -8,16 +8,64 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { PLUGIN, TRACE_ID_V041, TRACE_ID_V042, loadIndex, shortId, describe, liveTopLevel, dutyMap, stateDirs, queueScopeOf, inboxFileFor, messageOf } from './shared.js'
+import { PLUGIN, TRACE_ID, TRACE_ID_V041, TRACE_ID_V042, loadIndex, shortId, describe, liveTopLevel, dutyMap, stateDirs, queueScopeOf, inboxFileFor, isSessionIdLike, messageOf } from './shared.js'
 import { warn, tool } from './tools.js'
+// 唯一名 tmp + rename 重试的写盘通道：**复用 registrations.js 的那一份**（勿在本模块另写一套）。
+// 固定名 `<file>.tmp` 在两进程并发重写同一队列时会静默丢写（审计 P1-02 已复现）。
+// withDomainsLock：同一个模块里的跨进程 `.lock` 通道，本模块把它改名成 withFileLock 复用（见下）。
+import { writeAtomicUnique, withDomainsLock } from './registrations.js'
 import { pausedScopesOf, pausedScopesWords, pausedTargetOf, primaryPauseHit, pausedFactsOf, pausedSendHint } from './pause.js'
-import { loadDeclarations, resolveTarget } from './declaration.js'
+import { loadDeclarations, readOwnersBook, resolveTarget } from './declaration.js'
 import { offlineCandidateId, resolveWakeWiring, resumeSession } from './session-factory.js'
 
 export const INBOX_PENDING = 'pending'
 export const INBOX_DELIVERED = 'delivered'
 export const INBOX_FAILED = 'failed'
 export const INBOX_WITHDRAWN = 'withdrawn'
+
+/**
+ * 跨进程 `.lock` 通道（读-改-写用）。**与 registrations.js:171-238 同一份实现，不复制**：
+ * `withDomainsLock(domainsFile, fn)` 的语义本来就只是"给一个文件路径，按 `<file>.lock` 用 `wx`
+ * 独占（已存在必 EEXIST）+ 锁内 pid 判死接管 + `finally` 释放"，与"域名册"无关，所以这里只做
+ * 一次改名导出（照抄 65 行锁逻辑会分叉——同源注释挡不住分叉）。
+ *
+ * 契约（与 withDomainsLock 逐字相同）：回 `{ok, value, reason, error}`，**永不抛**；
+ * `fn` 抛错 ⇒ `{ok:false, reason:'function-threw'}`，锁照样在 finally 释放。
+ * **不可重入**：同一进程对同一个文件嵌套取锁会等到超时（15 次 × 20ms ⇒ `reason:'locked'`），
+ * 所以处理函数体内**绝不允许**再取同一把锁（见 updateInboxStatus / writeDomainStateAtomic）。
+ * 遗留：竞争告警文案沿用 registrations.js 的「域名册锁」字样（同一个函数；改文案要动
+ * registrations.js，本次任务不允许）。
+ */
+export function withFileLock(file, fn) {
+  let locked = withDomainsLock(file, fn)
+  // Windows 实测补丁：`wx` 撞上"对方**刚**删掉的那把锁"时报 EPERM/EACCES，而 registrations.js 的
+  // lockContention() 只在"此刻还看得见锁文件"时才算争用 ⇒ 极小概率把一次正常争用误判成
+  // `lock-failed`（2×20 条队列实测遇到 1/40：EPERM … open '<inbox>.lock'）。这里只对**这一类
+  // 瞬时 IO 错**做有界重试（≤3 次 × 25ms）；锁的实现/语义仍是 registrations.js 那一份，没有第二套。
+  for (let attempt = 0; attempt < 3 && !locked.ok && locked.reason === 'lock-failed' && transientLockError(locked.error); attempt++) {
+    sleepMs(25)
+    locked = withDomainsLock(file, fn)
+  }
+  return locked
+}
+
+/** 只认 Windows 上"抢锁时目录项正在变"这一类瞬时错误（EPERM/EACCES/EBUSY）；别的错照实回。 */
+function transientLockError(error) {
+  return /EPERM|EACCES|EBUSY/i.test(String(error ?? ''))
+}
+
+/** 同步小睡（不烧 CPU）：与 registrations.js 的 sleepSync 同款，只有几行，不构成第二套锁。 */
+function sleepMs(ms) {
+  if (!(ms > 0)) return
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      /* 兜底忙等：正常路径不会走到这里 */
+    }
+  }
+}
 
 /** JSONL read: one object per line; a broken line is skipped, never fatal. */
 export function readInboxLines(file) {
@@ -69,37 +117,49 @@ export function appendInboxRecord(stateDir, key, record) {
   }
 }
 
-/** Rewrite the whole queue atomically (status changes only; append stays the hot path). */
+/**
+ * Rewrite the whole queue atomically (status changes only; append stays the hot path).
+ * **自己不加锁**：整表替换必须与调用方的"先读"处在同一个临界区里，所以只由
+ * `updateInboxStatus()` 在 `withFileLock(<inbox file>)` 内调用。裸调本函数 = 丢更新（已复现）。
+ */
 export function rewriteInbox(stateDir, key, records) {
   const file = inboxFileFor(stateDir, key)
   const body = records.map((record) => JSON.stringify(record)).join('\n') + (records.length ? '\n' : '')
-  const tmp = file + '.tmp'
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(tmp, body, 'utf8')
-    fs.renameSync(tmp, file)
-    return { ok: true, file, bytes: Buffer.byteLength(body, 'utf8') }
+    // 唯一名 tmp（`<file>.<pid>.<rand>.tmp`）+ rename 重试 ≤10 次 × 10ms：与
+    // registrations.js:281-308 的 writeAtomicUnique **同款，勿各写一套**。
+    // 旧写法（固定名 `<file>.tmp` + 单次 rename）在并发重写同一队列时会 ENOENT 或
+    // 静默覆盖别人的整表（审计 P1-02 已复现）。
+    const written = writeAtomicUnique(file, body)
+    return { ok: true, file, bytes: written.bytes }
   } catch (error) {
-    try {
-      fs.unlinkSync(tmp)
-    } catch {
-      /* 清理失败不掩盖原始错误 */
-    }
     return { ok: false, file, error: messageOf(error) }
   }
 }
 
-/** pending -> delivered|failed|withdrawn, in place. Returns the updated record (or a reason). */
+/**
+ * pending -> delivered|failed|withdrawn, in place. Returns the updated record (or a reason).
+ *
+ * **锁包住整段 read-modify-write**（load → 改 status → rewrite），锁粒度＝**每个队列文件一把**
+ * （`<inbox>.lock`，不搞全局一把锁：多会话互不拖慢）。只锁 rewrite 无效——两个进程各拿一份旧
+ * 快照、后写覆盖先写（审计 P1-02 第二半实测：40 条只落到 31，两进程各自都回 ok:20/failed:0）。
+ * 拿不到锁 ⇒ 如实回 `reason:'locked'`，**绝不绕过锁裸写**。
+ */
 export function updateInboxStatus(stateDir, key, id, status, extra) {
-  const inbox = loadInbox(stateDir, key)
-  const index = inbox.records.findIndex((record) => record.id === id)
-  if (index === -1) return { ok: false, reason: 'not-found', file: inbox.file }
-  const before = inbox.records[index]
-  const next = { ...before, ...(extra || {}), status }
-  inbox.records[index] = next
-  const written = rewriteInbox(stateDir, key, inbox.records)
-  if (!written.ok) return { ok: false, reason: 'write-failed', error: written.error, file: inbox.file }
-  return { ok: true, file: inbox.file, before, record: next }
+  const file = inboxFileFor(stateDir, key)
+  const locked = withFileLock(file, () => {
+    const inbox = loadInbox(stateDir, key)
+    const index = inbox.records.findIndex((record) => record.id === id)
+    if (index === -1) return { ok: false, reason: 'not-found', file: inbox.file }
+    const before = inbox.records[index]
+    const next = { ...before, ...(extra || {}), status }
+    inbox.records[index] = next
+    const written = rewriteInbox(stateDir, key, inbox.records)
+    if (!written.ok) return { ok: false, reason: 'write-failed', error: written.error, file: inbox.file }
+    return { ok: true, file: inbox.file, before, record: next }
+  })
+  if (locked.ok) return locked.value
+  return { ok: false, reason: locked.reason === 'locked' ? 'locked' : 'lock-failed', error: locked.error, file }
 }
 
 /** Every queue file in the store, keyed by lower-cased domain key (dir read, degrades). */
@@ -274,7 +334,33 @@ export function buildSendTool(ctx, config) {
     },
     async (args, exec) => {
       const index = loadIndex(config.indexFile)
-      const declarations = loadDeclarations(config.domainsFile)
+      // ── F-04（鲁棒性审计 2026-10-23）：**所有权敏感路径必须 fail-closed**。
+      // 旧行为：域名册读不懂时 loadDeclarations 把它折成"空册" ⇒ 下面的「声明优先」解析退化成
+      // matchedBy=index-label（或 unreachable），干跑/真投都照走 —— 等于册子坏了当没人在任。
+      // 现在：target 是**域名/项目形态**（要查"谁在任"）⇒ 一律拒绝并说明原因；`sess-…` / `session-…`
+      // 形态的 target 直接按会话 id 寻址、不做所有权判断，因此不受这条限制（否则会误伤正常直投）。
+      const ownersBook = readOwnersBook(config.domainsFile)
+      const wantedTarget = String(args.target ?? '').trim()
+      if (!ownersBook.ok && wantedTarget && !isSessionIdLike(wantedTarget)) {
+        warn(
+          `[${TRACE_ID}] 拒绝投递：域名册读不懂（${ownersBook.file}）：${ownersBook.detail}` +
+            ` ⇒ 不做所有权判断，target=${wantedTarget} 按 fail-closed 拒绝。`,
+        )
+        return {
+          delivered: false,
+          queued: false,
+          ...(args.dryRun === true ? { dryRun: true } : {}),
+          reason: 'domains-unreadable',
+          detail: ownersBook.detail,
+          target: wantedTarget,
+          declarationsFile: config.domainsFile,
+          self: describe(exec?.agent, index),
+          hint:
+            '域名册读不懂（' + ownersBook.detail + '）⇒ 本次**不做所有权判断、不投递**（旧行为会在册子坏掉时按索引标注照投，绕过在任声明）。' +
+            '请先人工修好 ' + config.domainsFile + ' 再发。文件不存在＝正常空册，不会被这条拦住；按会话 id 直投（sess-… / session-…）也不受影响。',
+        }
+      }
+      const declarations = ownersBook.ok ? ownersBook.book : loadDeclarations(config.domainsFile)
       const duties = dutyMap(declarations)
       const self = describe(exec?.agent, index, duties)
 

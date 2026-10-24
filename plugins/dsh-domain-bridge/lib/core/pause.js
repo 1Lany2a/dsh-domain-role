@@ -9,7 +9,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { TRACE_ID_V040, TRACE_ID_V041, TRACE_ID_V042, SCOPE_DOMAIN, SCOPE_SESSION, SCOPE_PROJECT, SCOPE_GLOBAL, PAUSE_SCOPES, GLOBAL_KEY, SCOPE_ALIASES, STATE_POLICY_PAUSED, STATE_POLICY_ACTIVE, STATE_ONLINE_ACTIVE, STATE_ONLINE_PAUSED, STATE_OFFLINE_ACTIVE, STATE_OFFLINE_PAUSED, STATE_TERMINATED, DERIVED_STATE_LEGEND, loadIndex, emptyIndex, shortId, describe, liveTopLevel, dutyMap, isSessionOnline, stateDirs, stateFileFor, queueScopeOf, isFullSessionId, isSessionIdLike, messageOf } from './shared.js'
 import { warn, tool } from './tools.js'
-import { INBOX_PENDING, INBOX_DELIVERED, INBOX_FAILED, INBOX_WITHDRAWN, loadInbox, updateInboxStatus, loadInboxes, domainMessage, deliverToAgent } from './messaging.js'
+// 唯一名 tmp + rename 重试的写盘通道：**复用 registrations.js 的那一份**（勿在本模块另写一套）。
+// 固定名 `<file>.tmp` 在两进程并发写同一状态文件时会静默丢写（审计 P1-02 已复现：期望 120 实际 70）。
+import { writeAtomicUnique } from './registrations.js'
+import { INBOX_PENDING, INBOX_DELIVERED, INBOX_FAILED, INBOX_WITHDRAWN, loadInbox, updateInboxStatus, loadInboxes, domainMessage, deliverToAgent, withFileLock } from './messaging.js'
 import { loadDeclarations, readDeclarationsForWrite, checkName, projectFromCwd, resolveDomainKeyForState, matchDeclaration, resolveTarget } from './declaration.js'
 import { clipToBytes, liveAgentOf, resolveWakeWiring, resumeSession } from './session-factory.js'
 
@@ -173,13 +176,30 @@ export function loadPauseStateMap(config, candidates) {
 }
 
 /**
- * Read-modify-write one state record with the SAME atomic discipline as the declaration book
- * (write `<file>.tmp`, then rename). A file that exists but cannot be parsed ABORTS the write -
- * never overwrite somebody's state blindly. `patch` keys are merged over the existing record.
+ * Read-modify-write one state record under BOTH guarantees:
+ *   ① 跨进程互斥：整段"读旧记录 → 合并 patch → 写新记录"在 `withFileLock(<file>.lock)` 里
+ *      （锁粒度＝每个状态文件一把；`withFileLock` 就是 registrations.js 的 `withDomainsLock`，
+ *      不重造）。⚠️ 锁**不可重入**——临界区里不要再取同一把锁。
+ *   ② 原子落盘：UNIQUE tmp name (`<file>.<pid>.<rand>.tmp`) + rename with retries, through
+ *      `writeAtomicUnique()` from registrations.js (one implementation, not a second copy).
+ * A file that exists but cannot be parsed ABORTS the write - never overwrite somebody's state
+ * blindly. `patch` keys are merged over the existing record（合并发生在锁内 ⇒ 看到的是最新记录）。
  */
 export function writeDomainStateAtomic(stateDir, key, patch, scope) {
   const real = String(scope ?? '').trim().toLowerCase() || queueScopeOf(key)
   const file = stateFileFor(stateDir, key, real)
+  // 锁粒度＝**每个状态文件一把**（`<file>.lock`），包住"读旧记录 → 合并 patch → 写新记录"整段。
+  // 只锁写那一步没用：两进程都拿旧记录打底、后写覆盖先写 ⇒ 静默丢字段（审计 P1-02 第二半：
+  // 2×60 次只落到 73，两边各自都回 ok:60/failed:0）。
+  // 锁＝messaging.js 的 withFileLock（与 registrations.js 同一份实现）；**不可重入**，
+  // 所以临界区本体 applyDomainStateWrite() 里不得再取锁。
+  const locked = withFileLock(file, () => applyDomainStateWrite({ file, real, key, patch }))
+  if (locked.ok) return locked.value
+  return { ok: false, reason: locked.reason === 'locked' ? 'locked' : 'lock-failed', error: locked.error, file }
+}
+
+/** `writeDomainStateAtomic()` 的临界区本体：**只许在持锁时调用**（它自己不加锁）。 */
+function applyDomainStateWrite({ file, real, key, patch }) {
   let existing = new emptyDomainState(file)
   let raw
   try {
@@ -219,20 +239,16 @@ export function writeDomainStateAtomic(stateDir, key, patch, scope) {
     updatedAt: new Date().toISOString(),
   }
   const body = JSON.stringify(next, null, 2) + '\n'
-  const tmp = file + '.tmp'
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(tmp, body, 'utf8')
-    fs.renameSync(tmp, file)
+    // 唯一名 tmp（`<file>.<pid>.<rand>.tmp`）+ rename 重试 ≤10 次 × 10ms：与
+    // registrations.js:281-308 的 writeAtomicUnique **同款，勿各写一套**。
+    // 旧写法（固定名 `<file>.tmp` + 单次 rename）在两进程并发写同一状态文件时会 ENOENT 或
+    // 静默覆盖别人的写（审计 P1-02/P2-01 已复现：120 次自增只落到 70）。
+    const written = writeAtomicUnique(file, body)
+    return { ok: true, file, bytes: written.bytes, record: normalizeDomainState(next, file) }
   } catch (error) {
-    try {
-      fs.unlinkSync(tmp)
-    } catch {
-      /* 清理失败不掩盖原始错误 */
-    }
     return { ok: false, reason: 'write-failed', error: messageOf(error), file }
   }
-  return { ok: true, file, bytes: Buffer.byteLength(body, 'utf8'), record: normalizeDomainState(next, file) }
 }
 
 // --- persisted inbox (the queue that makes "paused but queued" survive a dsh restart) ---

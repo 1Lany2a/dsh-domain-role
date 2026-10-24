@@ -16,10 +16,13 @@
 # ⚠️ 安全默认：代码里的缺省值是 workspace-write。要 danger-full-access（全盘写 + 免审批）请**自己显式写**，
 #    或按单个调用传 permissionPreset——这等于把「信任这台机器上的全部内容」写在配置里。
 # stateDir（v0.4.0）：政策轴（暂停）＋ 队列的落盘目录，缺省 <home>/state（home 见上）；写 '' 也退回默认。
+#
+# ⚠️ 本机显式选择：下面这行是**本机主动开**的 danger-full-access（无人值守的域会话不能卡在等人点同意）。
+#    开源仓的缺省值是 workspace-write；这里写死是"我信任这台机器上的全部内容"的显式声明，不是默认值。
 - insert:
     - id: domain-bridge
       name: 'dsh-domain-bridge'
       config:
         indexFile: ''
         domainsFile: ''
-        domainSessionPreset: 'workspace-write'
+        domainSessionPreset: 'danger-full-access'

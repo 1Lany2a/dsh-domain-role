@@ -18,7 +18,7 @@
 import { VERSION, textOf } from './shared.js'
 import { readRegistrations, identityOf, projectOfCwd } from './registrations.js'
 import { catalogFromController, catalogFromLlm } from './session-factory.js'
-import { defaultHandoffTask } from './commands.js'
+import { defaultHandoffTask, defaultHandoffTitle } from './commands.js'
 
 const PERMISSION_CHOICES = [
   { value: '', label: '部署默认（config.domainSessionPreset）', detail: '不覆盖，交给部署配置；本机缺省 workspace-write' },
@@ -104,7 +104,7 @@ export async function wizardData(ctx, deps, { sessionId, cwd }) {
       // 权限档默认＝部署配置（空串表示"不覆盖"，回执里会写清楚）
       permission: typeof config.domainSessionPreset === 'string' ? config.domainSessionPreset : '',
       model: configuredModel ? `${configuredModel.provider}/${configuredModel.model}` : '',
-      title: `【${layer === 'system' ? '体系' : layer === 'project' ? '项目' : '域'}】${key} 接任`,
+      title: defaultHandoffTitle(layer, key),
       task: defaultHandoffTask({ layer, key, cwd }),
     },
     notes: [

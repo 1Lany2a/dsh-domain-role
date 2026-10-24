@@ -62,6 +62,29 @@ export function loadDeclarations(file) {
   }
 }
 
+/**
+ * Discriminating read of the owners book (fail-closed gate for ownership-sensitive paths).
+ *
+ * `loadDeclarations()` folds a read/parse failure into an EMPTY book plus an `error` string, and
+ * callers that only look at `entries` silently degrade to "nobody is on duty" — which is how a
+ * garbled `domains.json` used to turn `send_to_domain` into index-label delivery and let
+ * `create_domain_session` open a second live session (robustness audit 2026-10-23, F-04).
+ *
+ * This wrapper keeps the honest distinction:
+ *   · file missing            ⇒ {ok:true, book} with 0 declarations — a NORMAL empty book;
+ *   · file unreadable/garbled ⇒ {ok:false, reason:'domains-unreadable', detail} — never disguised
+ *                               as an empty book, so ownership-sensitive callers must refuse.
+ * Read-only display paths (list_domain_owners / list_domain_sessions / /state) keep using
+ * `loadDeclarations()` and keep REPORTING the error instead of throwing.
+ */
+export function readOwnersBook(file) {
+  const book = loadDeclarations(file)
+  if (book.error) {
+    return { ok: false, reason: 'domains-unreadable', detail: book.error, file, fileExisted: book.fileExisted }
+  }
+  return { ok: true, book }
+}
+
 /** sessionId -> every declaration entry that session holds (sorted by key). */
 export function declarationInfo(entry, declarations) {
   return {
@@ -719,10 +742,15 @@ export function buildClaimTool(ctx, config) {
         return {
           action: 'claim',
           outcome: 'aborted',
+          // reason 保持 declarations-file-unreadable（既有契约/冒烟断言），另给可判别的 code：
+          // 三条所有权敏感路径统一用 'domains-unreadable' 这个判别词（F-04）。
           reason: 'declarations-file-unreadable',
+          code: 'domains-unreadable',
           error: read.parseError,
           file: config.domainsFile,
-          hint: '声明文件已存在但读不懂，为避免覆盖别人的声明，本次没有写入任何文件。',
+          hint:
+            '域名册读不懂，不做所有权判断：声明文件已存在但读不懂，为避免覆盖别人的声明，本次没有写入任何文件。' +
+            '请人工修好 ' + config.domainsFile + '（文件不存在＝正常空册，不会被这条拦住）。',
           self,
         }
       }

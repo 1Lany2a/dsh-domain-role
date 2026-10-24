@@ -396,7 +396,9 @@ for (const cfg of [undefined, null]) {
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const versionProbe = await call(mount(), 'list_domain_owners', {}, {}, 'version-probe')
 eq(versionProbe.plugin.version, pkg.version, `VERSION(${versionProbe.plugin.version}) 与 package.json(${pkg.version}) 不一致`)
-eq(pkg.version, '0.8.7', `package.json 版本不对（实际 ${pkg.version}）`)
+const sharedMod = await import(new URL('../lib/core/shared.js', import.meta.url))
+eq(pkg.version, sharedMod.VERSION, `package.json(${pkg.version}) 与 shared.VERSION(${sharedMod.VERSION}) 不一致——版本号三处（package.json / shared.VERSION / 部署）必须同步`)
+ok(/^\d+\.\d+\.\d+$/.test(pkg.version), `版本号不是 semver：${pkg.version}`)
 
 // ------------------------------------------------------------------ 1. list_domain_sessions
 
@@ -3024,9 +3026,13 @@ function fakeAgentPresets(resolvedId) {
   eq(listed.domainState.unreadableStateFiles.length, 1, '读不懂的状态文件必须列出来（降级不静默）')
   ok(listed.domainState.degradeNote.includes('不拦投递'), '应说明这个失败方向')
 
-  // (b) 写不进去（.tmp 被目录占位）⇒ write-failed，且如实说"政策轴没变"。
+  // (b) 写不进去 ⇒ write-failed，且如实说"政策轴没变"。
+  //     夹具与具体 tmp 命名无关：把**目标文件**设成只读 ⇒ 任何"写 tmp + rename 到目标"的实现都会失败。
   const blockedDir = path.join(root, 'state-v040-blocked')
-  fs.mkdirSync(path.join(blockedDir, 'domains', safeName('misas:asr') + '.json.tmp'), { recursive: true })
+  const blockedStateFile = path.join(blockedDir, 'domains', safeName('misas:asr') + '.json')
+  fs.mkdirSync(path.dirname(blockedStateFile), { recursive: true })
+  fs.writeFileSync(blockedStateFile, JSON.stringify({ scope: 'domain', key: 'misas:asr', paused: false, pausedAt: null, pausedBy: null, note: null }), 'utf8')
+  fs.chmodSync(blockedStateFile, 0o444)
   const blocked = await call(
     mount({ domainsFile: book, stateDir: blockedDir }),
     'set_domain_state',
@@ -3038,6 +3044,7 @@ function fakeAgentPresets(resolvedId) {
   eq(blocked.reason, 'write-failed', 'reason 应为 write-failed')
   ok(typeof blocked.error === 'string' && blocked.error.length > 0, '应带上真实错误文本')
   ok(blocked.hint.includes('没有变') || blocked.hint.includes('照旧'), '应说清政策轴没有变')
+  fs.chmodSync(blockedStateFile, 0o666)
 
   // (c) 队列文件里混进坏行 ⇒ 好行照用、坏行只记账不炸。
   const dirtyDir = path.join(root, 'state-v040-dirty')

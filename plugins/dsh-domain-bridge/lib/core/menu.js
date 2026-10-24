@@ -16,6 +16,7 @@ import { loadDeclarations } from './declaration.js'
 import { loadDomainStates } from './pause.js'
 import { callerCwd } from './commands.js'
 import { wizardData, wizardHtml, runWizard } from './wizard.js'
+import { buildStateSnapshot } from './state.js'
 import { warn } from './tools.js'
 
 const ROUTE_PREFIX = '/api/dsh-domain-bridge'
@@ -358,21 +359,23 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
       ok: true,
       options: [
         option('self 紧急暂停（菜单）', '强制暂停自己', '任何会话都能按', { group: group('self', '紧急 · 单会话') }),
-        option('project 紧急暂停（菜单） --confirm', '强制暂停本项目', '任意会话可发起；会写原因与审计', {
+        // F-05（审计 2026-10-23）：这一行的 `--confirm` 不再是"跳过第一步"的漏洞——菜单执行器会
+        // **一次点选补上第一步（写待确认）再带 --confirm 执行**。行文案把后果写清，别让人以为只是"记一笔"。
+        option('project 紧急暂停（菜单） --confirm', '强制暂停本项目', '点确认后**立刻生效**：本项目的投递改落盘入队、create/wake 被拦，正在跑的回合不打断；恢复用 /resume project', {
           group: group('project', '紧急 · 项目'),
           confirmation: {
             title: '确认强制暂停本项目？',
-            description: '会写审计（原因：紧急暂停（菜单））。正在跑的回合不会被打断。',
+            description: '确认后立刻按下「项目」这一级（菜单会自己完成"写待确认 + 执行"两步），并写审计（原因：紧急暂停（菜单））。正在跑的回合不会被打断。',
             confirmLabel: '确认强制暂停',
             cancelLabel: '取消',
             acknowledgeLabel: '我知道这是紧急通道',
           },
         }),
-        option('global 紧急暂停（菜单） --confirm', '强制暂停全局', '任意会话可发起；会写原因与审计', {
+        option('global 紧急暂停（菜单） --confirm', '强制暂停全局', '点确认后**立刻生效**：整个体系新投递改入队、create 被拒、wake 被拦，正在跑的回合不打断；恢复用 /resume global', {
           group: group('global', '紧急 · 全局'),
           confirmation: {
             title: '确认强制暂停全局？',
-            description: '整个体系的新投递会被拦下，并写审计。正在跑的回合不会被打断。',
+            description: '确认后立刻按下「全局」这一级（菜单会自己完成"写待确认 + 执行"两步）：整个体系的新投递会被拦下，并写审计。正在跑的回合不会被打断。',
             confirmLabel: '确认强制暂停全局',
             cancelLabel: '取消',
             acknowledgeLabel: '我知道这会让整个体系停下来',
@@ -385,24 +388,11 @@ export function buildMenuOptions(ctx, deps, { command, sessionId, cwd }) {
   return { ok: false, error: `unknown-command: ${command}`, options: [] }
 }
 
-/** Execute one menu choice through the very same command definition the typed line uses. */
-export async function runMenuChoice(ctx, deps, { command, sessionId, input }) {
-  const definition = (deps.commandDefs || []).find((item) => item.name === command)
-  if (!definition) return { ok: false, kind: 'error', text: `未知命令：${command}` }
-  let agent = null
-  const agentsService = serviceOf(ctx, 'agents')
-  try {
-    agent = agentsService && typeof agentsService.get === 'function' ? agentsService.get(sessionId) : null
-  } catch {
-    agent = null
-  }
-  if (!agent) {
-    return { ok: false, kind: 'error', text: '这条会话现在没有活 Agent（窗口已关或刚重启过）⇒ 菜单动作不执行。请在自己的窗口里操作。' }
-  }
-
-  const line = `/${command}${input ? ` ${input}` : ''}`
-  // Preferred path: the Host command executor. It logs command/run + command/done, so the receipt
-  // renders as a persistent flow node in this session — the popup needs no display surface of its own.
+/**
+ * Run ONE slash-command tail through the host executor (preferred: it logs command/run + command/done,
+ * so the receipt renders as a persistent flow node) with the in-process fallback.
+ */
+async function runCommandLine(ctx, definition, agent, line, rawInput) {
   const commands = serviceOf(ctx, 'commands')
   if (commands && typeof commands.execute === 'function') {
     try {
@@ -421,11 +411,81 @@ export async function runMenuChoice(ctx, deps, { command, sessionId, input }) {
   }
   // Fallback: run the definition in-process (no flow node, but the action still happens).
   try {
-    const result = await definition.handler({ agent, rawInput: String(input ?? ''), commandId: 'menu' })
+    const result = await definition.handler({ agent, rawInput: String(rawInput ?? ''), commandId: 'menu' })
     return { ok: result.kind === 'success', kind: result.kind, text: result.text }
   } catch (error) {
     return { ok: false, kind: 'error', text: `菜单动作执行失败：${error?.message || String(error)}` }
   }
+}
+
+/** Execute one menu choice through the very same command definition the typed line uses. */
+export async function runMenuChoice(ctx, deps, { command, sessionId, input }) {
+  const definition = (deps.commandDefs || []).find((item) => item.name === command)
+  if (!definition) return { ok: false, kind: 'error', text: `未知命令：${command}` }
+  let agent = null
+  const agentsService = serviceOf(ctx, 'agents')
+  try {
+    agent = agentsService && typeof agentsService.get === 'function' ? agentsService.get(sessionId) : null
+  } catch {
+    agent = null
+  }
+  if (!agent) {
+    return { ok: false, kind: 'error', text: '这条会话现在没有活 Agent（窗口已关或刚重启过）⇒ 菜单动作不执行。请在自己的窗口里操作。' }
+  }
+
+  const line = `/${command}${input ? ` ${input}` : ''}`
+
+  // ── F-05（鲁棒性审计 2026-10-23）：`/pause-all` 是"先写待确认、60 秒内带 --confirm 才执行"的两步协议，
+  // 而菜单行的 id 里本来就带着 `--confirm`（弹窗自己已经弹过一次确认浮层）⇒ 旧行为是直接跳到第二步，
+  // 待确认从没被写过，于是永远回"没有待确认的强制暂停"，紧急通道从 UI 根本用不了。
+  // 现在菜单这条路**一次点选就按两步走完**：先发不带 --confirm 的那一步（写 pending），紧接着带
+  // --confirm 执行一次，两段回执一起带回；任何一步失败都如实返回失败（ok:false），不假装成功。
+  const pauseAllConfirm = command === 'pause-all' && /(^|\s)--confirm(\s|$)/.test(String(input ?? ''))
+  if (pauseAllConfirm) {
+    const stagedInput = String(input ?? '')
+      .replace(/(^|\s)--confirm(?=\s|$)/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const stagedLine = `/${command}${stagedInput ? ` ${stagedInput}` : ''}`
+    const stepOne = await runCommandLine(ctx, definition, agent, stagedLine, stagedInput)
+    if (!stepOne.ok) {
+      warn(`menu: pause-all 第一步（写待确认）失败，第二步不执行：${stagedLine}`)
+      return {
+        ok: false,
+        kind: 'error',
+        text: [
+          '菜单「强制暂停」没有完成：**第 1 步（写待确认）就失败了**，第 2 步没有执行（pending 不存在时不能假装成功）。',
+          stepOne.text,
+        ].join('\n\n'),
+        steps: { writePending: { ok: false, kind: stepOne.kind, text: stepOne.text }, confirm: null },
+      }
+    }
+    const stepTwo = await runCommandLine(ctx, definition, agent, line, input)
+    warn(
+      `menu: pause-all 一步完成两步（写待确认=${stepOne.ok ? 'ok' : 'fail'}，确认执行=${stepTwo.ok ? 'ok' : 'fail'}）：${line}`,
+    )
+    return {
+      ok: Boolean(stepTwo.ok),
+      kind: stepTwo.ok ? 'success' : 'error',
+      text: [
+        '菜单「强制暂停」：一次点选已按两步协议走完。',
+        '',
+        '**第 1 步 · 写待确认**',
+        stepOne.text,
+        '',
+        stepTwo.ok ? '**第 2 步 · 带 --confirm 执行：成功**' : '**第 2 步 · 带 --confirm 执行：失败（没有生效）**',
+        stepTwo.text,
+        '',
+        stepTwo.ok ? '✅ 强制暂停已生效（明细见第 2 步回执里的 JSON）。' : '⚠️ 强制暂停**没有生效**：见第 2 步的失败原因。',
+      ].join('\n'),
+      steps: {
+        writePending: { ok: true, kind: stepOne.kind, text: stepOne.text },
+        confirm: { ok: Boolean(stepTwo.ok), kind: stepTwo.kind, text: stepTwo.text },
+      },
+    }
+  }
+
+  return runCommandLine(ctx, definition, agent, line, input)
 }
 
 function readBody(req) {
@@ -587,6 +647,22 @@ export function registerMenuRoutes(ctx, deps) {
         writeJson(res, 200, out)
       } catch (error) {
         writeJson(res, 200, { ok: false, kind: 'error', text: error?.message || String(error) })
+      }
+    },
+  })
+  // ── v0.8.8 只读状态快照：侧栏「会话状态」块的唯一数据源（只读、不写盘、不唤醒任何人）。
+  register({
+    kind: 'exact',
+    path: `${ROUTE_PREFIX}/state`,
+    handler: async (req, res) => {
+      if (!localOnly(req)) return writeJson(res, 403, { ok: false, error: 'local-only' })
+      try {
+        const sessionId = wizardQuery(req)
+        const agent = sessionId ? liveAgentOf(ctx, sessionId) : null
+        const cwd = agent ? callerCwd(ctx, agent) : null
+        writeJson(res, 200, buildStateSnapshot(ctx, deps, { cwd }))
+      } catch (error) {
+        writeJson(res, 200, { ok: false, error: error?.message || String(error) })
       }
     },
   })

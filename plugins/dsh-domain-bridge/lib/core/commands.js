@@ -24,7 +24,7 @@ import {
 } from './registrations.js'
 import { loadDeclarations } from './declaration.js'
 import { loadDomainStates } from './pause.js'
-import { sessionOf, markRetired } from './session-factory.js'
+import { sessionOf, markRetired, minuteStamp } from './session-factory.js'
 import { stateRoot, webOrigin, isFullSessionId, isSessionIdLike } from './shared.js'
 import { warn } from './tools.js'
 
@@ -32,6 +32,17 @@ const HANDOFF_DEFAULTS = {
   model: { provider: 'wb', model: 'cn:deepseek-v4.1-flash' },
   presets: { system: 'cordis', project: 'standard', domain: 'standard' },
   permission: { system: 'danger-full-access', project: 'workspace-write', domain: 'danger-full-access' },
+}
+
+/**
+ * 交接默认标题：`【体系】2026-10-22 19:48 · tixiweihu:system 接任`。
+ * v0.8.9：把时间戳放回来——v0.8.5 改「按层建会话」时默认标题被简化成 `【体系】<键> 接任`，
+ * 时间戳丢了，侧栏里连着几次换届看不出先后（用户 2026-10-22 报的 bug）。
+ * 这里是**唯一**一处拼默认标题：`/handoff` 命令行与分步表单都从它取，不会再分叉。
+ */
+export function defaultHandoffTitle(layer, key, date = new Date()) {
+  const prefix = layer === 'system' ? '【体系】' : layer === 'project' ? '【项目】' : '【域】'
+  return `${prefix}${minuteStamp(date)} · ${key} 接任`
 }
 
 /** One-line receipt text. Everything user-facing is Chinese and states the next step. */
@@ -560,9 +571,7 @@ function handoffCommand(ctx, deps) {
       const perm = textOf(param('perm')) || null
       const target = textOf(param('target')) || 'new'
       const retireNow = String(param('retire') ?? '') === 'now' || parsed.flags.has('retire-now')
-      const title =
-        textOf(param('title')) ||
-        `【${layer === 'system' ? '体系' : layer === 'project' ? '项目' : '域'}】${key} 接任`
+      const title = textOf(param('title')) || defaultHandoffTitle(layer, key)
 
       // v0.8.7：**交给一个已经开着的会话**。v1 以前这里直接拒绝（"只能新建"），
       // 于是"换届给已存在的窗口"这条最自然的路被堵死——只能先 retire 再让对方自己 /register。
@@ -887,6 +896,22 @@ function clearPauseAllPending(config, sessionId) {
   }
 }
 
+/**
+ * Did `set_domain_state` refuse / fail? Only a receipt that really leaves this scope paused may be
+ * reported as success; `already-paused` is an idempotent success (the wanted state already holds).
+ * Added with F-05 (robustness audit 2026-10-23): `/pause-all` used to return `kind:'success'` even
+ * when the pause tool refused, so the menu showed "done" for a pause that never happened.
+ */
+function pauseAllRefusalOf(result) {
+  if (!result || typeof result !== 'object') return '工具没有返回结果'
+  const outcome = String(result.outcome ?? '')
+  if (outcome === 'paused' || outcome === 'already-paused' || outcome === 'resumed') return null
+  // Results without an `outcome` (older/fake tool shapes) are judged by `ok`, so a legacy
+  // `{ok:true, state:'paused'}` receipt is still a success.
+  if (!outcome) return result.ok === true ? null : String(result.error || result.reason || result.hint || 'missing-outcome')
+  return String(result.reason || result.hint || outcome)
+}
+
 function pauseAllCommand(ctx, deps) {
   return {
     name: 'pause-all',
@@ -949,8 +974,21 @@ function pauseAllCommand(ctx, deps) {
         { agent },
       )
       const audit = appendAudit(deps.config, { action: 'pause-all', scope: target.scope, key: target.key, by: sessionId, reason })
+      // F-05：工具拒绝 / 写盘失败时**不许回 success**（旧行为一律 reply(true)，菜单看起来"做完了"）。
+      const refusal = pauseAllRefusalOf(result)
+      if (refusal) {
+        return reply(false, [
+          `**强制暂停没有生效**：${level}（${target.key}）`,
+          `· 原因：${refusal}`,
+          '· 政策轴没有改变：一切照旧，修好上面的原因后再试。',
+          audit.ok ? `· 审计已落盘（记录的是"已发起"）：${audit.file}` : `· ⚠️ 审计写入失败：${audit.error}`,
+          '```json', JSON.stringify(result, null, 2), '```',
+        ])
+      }
       return reply(true, [
-        `**强制暂停已执行**：${level}（${target.key}）`,
+        result && result.outcome === 'already-paused'
+          ? `**本来就已经暂停**（幂等，没有改动）：${level}（${target.key}）`
+          : `**强制暂停已执行**：${level}（${target.key}）`,
         audit.ok ? `· 审计已落盘：${audit.file}` : `· ⚠️ 审计写入失败：${audit.error}`,
         '· ⚠️ 正在跑的回合不会被打断；恢复要人显式按 active。',
         '```json', JSON.stringify(result, null, 2), '```',

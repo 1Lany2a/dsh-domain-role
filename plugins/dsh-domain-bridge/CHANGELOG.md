@@ -3,6 +3,43 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本。
 0.x 阶段：次版本号变化＝行为变化，修订号＝缺陷修复与内部瘦身。
 
+## [0.8.9] — 2026-10-22
+
+**两个 bug：点「逐项设置参数」什么都不出；接任会话标题丢了时间戳。**
+
+### 一、`/handoff` →「逐项设置参数」点完没反应（修）
+
+根因在**宿主弹窗壳**，不在命令：`ui-commands` 的 `PopupSelectController.settle` 只认 `onSelect` 抛不抛错，**返回值整个丢掉**（然后关壳、把焦点还给输入框）。`/handoff wizard` 的回执恰好只有一句话 + 一个地址 ⇒ 界面上等于"点了没反应"。
+
+修法：这一行改由**客户端自己开窗**——`openHandoffWizard()` 按同一份路由拼地址（`<origin>/api/dsh-domain-bridge/handoff-wizard?sessionId=…`，不去解析回执文本），并且**在任何 await 之前**调 `window.open`（用户手势一过期就会被当 popup 拦掉）。桌面端主窗口对 http(s) 的 `window.open` 走 `shell.openExternal` ⇒ 表单在**系统默认浏览器**里打开。
+
+### 二、接任会话标题没有时间戳（修）
+
+v0.8.5 改「按层建会话」时把默认标题简化成 `【体系】<键> 接任`，时间戳丢了；而 `create_domain_session` 自带的默认标题（`【体系】2026-10-22 19:48 · 任务首句`）又被这个显式 title 顶掉，于是侧栏里连着几次换届看不出先后。
+
+现在 `/handoff` 命令行与分步表单**共用** `defaultHandoffTitle(layer, key)`：
+
+- 体系主 ⇒ `【体系】2026-10-22 19:48 · tixiweihu:system 接任`
+- 项目主 ⇒ `【项目】2026-10-22 19:48 · <项目>:main 接任`
+
+表单里把标题**清空**仍然可以让工厂自己生成（`【体系】<建会话时刻> · 任务首句`）。
+
+`smoke` 284/55,559 · `commands` 88 · `menu` 51 · `lifecycle` 15 · `bootstrap` 16/121 · `registrations` 13/175 · `wizard` 36 · `state` 28 —— 全过。
+
+## [0.8.8] — 2026-10-21
+
+**只读状态快照：侧栏「会话状态」块的数据源。**
+
+新增 `lib/core/state.js` + `GET /api/dsh-domain-bridge/state`：把注册册、域声明、四级暂停、队列 pending、索引快照五本账拼成**一份只读快照**给 GUI 用——GUI 只渲染、不自己算。
+
+- `buildStateSnapshot(ctx, deps, {cwd})` 全程无副作用：不写文件、不调模型、不唤醒任何会话；任何一本账读不懂 ⇒ 对应表为空 + 一条 `warnings`，绝不抛。
+- 输出：`systems` / `projects`（每项带 `main` / `domains` / `adoption` / `hasProjectFile` / `group`）/ `sessions` / `history` / `records` / `totals` / `freshness`。
+- **接入判定与** `/adopt` **同一口径**：有 `<项目>:main` 才算 `adopted`；体系根（有 `<项目>:system`）单独标 `system`，不会被误报成「未接入」；索引里被发现、但从没注册的项目如实标 `unregistered`（老项目就是靠这条被看见）。
+- 嵌套项目根（`study/cpp-learning` 这类）给 `group`，GUI 可以把学科折进「study」下面，避免 20+ 张卡一次铺开。
+- 索引 600 KB，按 (mtime,size) 缓存，不每次请求重解析。
+
+`smoke` 284/55,559 · `commands` 87 · `menu` 51 · `lifecycle` 15 · `bootstrap` 16/121 · `registrations` 13/175 · `wizard` 31 · `state` 28 —— 全过。
+
 ## [0.8.7] — 2026-10-21
 
 **换届能逐项改参数了（本地分步表单）＋ 三个「说了没做」的口子合上。**
